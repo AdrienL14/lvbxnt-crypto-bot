@@ -13,8 +13,8 @@ import requests
 from flask import Flask, request, jsonify
 
 # =========================================================
-# LVBXNT_Crypto_Bot - V1.1 STABLE
-# Flask + Telegram Webhook + SQLite + Binance Market Data
+# LVBXNT_Crypto_Bot - V1.2 STABLE (BYBIT DATA)
+# Flask + Telegram Webhook + SQLite + Bybit Market Data
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -24,8 +24,7 @@ SCAN_SECRET = os.getenv("SCAN_SECRET", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "crypto_bot.db")
 PORT = int(os.getenv("PORT", "10000"))
 
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision").rstrip("/")
-BINANCE_FALLBACK_URL = os.getenv("BINANCE_FALLBACK_URL", "https://api.binance.com").rstrip("/")
+BYBIT_BASE_URL = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/")
 
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -426,70 +425,83 @@ def toggle_watch_symbol(chat_id: int, symbol: str) -> bool:
 
 
 # =========================================================
-# MARKET DATA
+# MARKET DATA - BYBIT
 # =========================================================
+def interval_to_bybit(interval: str) -> str:
+    mapping = {
+        "1m": "1",
+        "3m": "3",
+        "5m": "5",
+        "15m": "15",
+        "30m": "30",
+        "1h": "60",
+        "2h": "120",
+        "4h": "240",
+        "6h": "360",
+        "12h": "720",
+        "1d": "D",
+        "1w": "W",
+    }
+    return mapping.get(interval, "60")
+
+
 def http_get_json(url: str, params: Dict[str, Any]) -> Any:
     resp = requests.get(
         url,
         params=params,
         timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": "LVBXNT_Crypto_Bot/1.1"}
+        headers={"User-Agent": "LVBXNT_Crypto_Bot/1.2"}
     )
 
-    content_type = resp.headers.get("Content-Type", "")
     text_preview = resp.text[:500]
-
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code} from market API: {text_preview}")
 
     try:
-        data = resp.json()
+        return resp.json()
     except Exception:
-        raise RuntimeError(f"Réponse non JSON depuis market API: {content_type} | {text_preview}")
-
-    if isinstance(data, dict) and data.get("code") not in (None, 0):
-        raise RuntimeError(f"Erreur API marché: {data}")
-
-    return data
+        raise RuntimeError(f"Réponse non JSON depuis market API: {text_preview}")
 
 
 def fetch_klines(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = DEFAULT_LIMIT) -> List[Dict[str, float]]:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    urls = [
-        f"{BINANCE_BASE_URL}/api/v3/klines",
-        f"{BINANCE_FALLBACK_URL}/api/v3/klines",
-    ]
+    url = f"{BYBIT_BASE_URL}/v5/market/kline"
+    params = {
+        "category": "spot",
+        "symbol": symbol,
+        "interval": interval_to_bybit(interval),
+        "limit": min(max(limit, 50), 200),
+    }
 
-    last_error = None
+    data = http_get_json(url, params)
 
-    for url in urls:
-        try:
-            raw = http_get_json(url, params)
-            if not isinstance(raw, list) or len(raw) < 20:
-                raise RuntimeError(f"Données insuffisantes depuis {url}: {str(raw)[:300]}")
+    ret_code = data.get("retCode")
+    if ret_code != 0:
+        raise RuntimeError(f"Erreur API marché Bybit: {str(data)[:500]}")
 
-            candles = []
-            for item in raw:
-                if not isinstance(item, list) or len(item) < 7:
-                    raise RuntimeError(f"Format de bougie invalide depuis {url}: {str(item)[:200]}")
-                candles.append({
-                    "open_time": int(item[0]),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]),
-                    "close_time": int(item[6]),
-                })
+    result = data.get("result", {})
+    raw_list = result.get("list", [])
 
-            logger.info("Market data OK for %s via %s", symbol, url)
-            return candles
+    if not isinstance(raw_list, list) or len(raw_list) < 20:
+        raise RuntimeError(f"Données insuffisantes depuis Bybit pour {symbol}: {str(data)[:500]}")
 
-        except Exception as e:
-            last_error = e
-            logger.warning("Market fetch failed for %s via %s -> %s", symbol, url, str(e))
+    candles = []
+    for item in raw_list:
+        if not isinstance(item, list) or len(item) < 6:
+            raise RuntimeError(f"Format de bougie Bybit invalide: {str(item)[:200]}")
+        # Bybit returns newest first -> we reverse later
+        candles.append({
+            "open_time": int(item[0]),
+            "open": float(item[1]),
+            "high": float(item[2]),
+            "low": float(item[3]),
+            "close": float(item[4]),
+            "volume": float(item[5]),
+            "close_time": int(item[0]),
+        })
 
-    raise RuntimeError(f"Impossible de récupérer les données pour {symbol}: {last_error}")
+    candles.reverse()
+    logger.info("Market data OK for %s via Bybit", symbol)
+    return candles
 
 
 # =========================================================
@@ -673,7 +685,6 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     reasons: List[str] = []
     score = 0
 
-    # Trend (30)
     if trend_bull or trend_bear:
         score += 22
         reasons.append("Tendance claire")
@@ -683,7 +694,6 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     else:
         reasons.append("Tendance peu claire")
 
-    # Momentum (20)
     if momentum_up or momentum_down:
         score += 14
         reasons.append("Momentum présent")
@@ -693,7 +703,6 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     else:
         reasons.append("Momentum faible")
 
-    # RSI (15)
     if 52 <= current_rsi <= 68 or 32 <= current_rsi <= 48:
         score += 12
         reasons.append("RSI propre")
@@ -703,7 +712,6 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     else:
         reasons.append("RSI extrême ou peu utile")
 
-    # Structure (20)
     if ema_spread_pct >= 0.18:
         score += 8
         reasons.append("Structure correcte")
@@ -1138,7 +1146,7 @@ def handle_analyze(chat_id: int, symbol: str) -> None:
         send_message(
             chat_id,
             "❌ Erreur pendant l’analyse.\n\n"
-            "Vérifie que Render a fini de redéployer, puis réessaie dans 10 secondes."
+            "Réessaie dans 10 secondes. Si ça bloque encore, envoie-moi la capture des logs Render."
         )
 
 
