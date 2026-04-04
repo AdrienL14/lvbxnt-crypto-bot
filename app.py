@@ -1,5 +1,4 @@
 import os
-import math
 import time
 import json
 import uuid
@@ -7,7 +6,6 @@ import hmac
 import html
 import sqlite3
 import logging
-import hashlib
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,28 +13,27 @@ import requests
 from flask import Flask, request, jsonify
 
 # =========================================================
-# LVBXNT_Crypto_Bot - V1
-# Single-file premium crypto Telegram bot for Render
+# LVBXNT_Crypto_Bot - V1.1 STABLE
+# Flask + Telegram Webhook + SQLite + Binance Market Data
 # =========================================================
 
-# -----------------------------
-# CONFIG
-# -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional
-SCAN_SECRET = os.getenv("SCAN_SECRET", "").strip()        # required for /run_scan
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+SCAN_SECRET = os.getenv("SCAN_SECRET", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "crypto_bot.db")
 PORT = int(os.getenv("PORT", "10000"))
 
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision").rstrip("/")
+BINANCE_FALLBACK_URL = os.getenv("BINANCE_FALLBACK_URL", "https://api.binance.com").rstrip("/")
+
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 DEFAULT_INTERVAL = "1h"
 DEFAULT_LIMIT = 120
 DEFAULT_RISK_PERCENT = 1.0
-SIGNAL_COOLDOWN_SECONDS = 60 * 60 * 6  # 6 hours
-AUTO_SCAN_COOLDOWN_SECONDS = 60 * 15   # 15 minutes
+SIGNAL_COOLDOWN_SECONDS = 60 * 60 * 6
+AUTO_SCAN_COOLDOWN_SECONDS = 60 * 15
 REQUEST_TIMEOUT = 20
 
 SUPPORTED_SYMBOLS = [
@@ -177,20 +174,25 @@ def get_meta(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 # =========================================================
-# TELEGRAM HELPERS
+# TELEGRAM
 # =========================================================
 def telegram_request(method: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
+        raise RuntimeError("BOT_TOKEN manquant")
+
     url = f"{TELEGRAM_API_BASE}/{method}"
     resp = requests.post(url, json=payload or {}, timeout=REQUEST_TIMEOUT)
+
     try:
         data = resp.json()
     except Exception:
+        logger.error("Telegram non-JSON response on %s: %s", method, resp.text[:500])
         resp.raise_for_status()
         raise
+
     if not data.get("ok", False):
         logger.warning("Telegram API error on %s: %s", method, data)
+
     return data
 
 
@@ -243,6 +245,7 @@ def answer_callback(callback_query_id: str, text: str = "", show_alert: bool = F
 def set_webhook() -> Dict[str, Any]:
     if not RENDER_EXTERNAL_URL:
         return {"ok": False, "description": "RENDER_EXTERNAL_URL manquant"}
+
     webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
     payload: Dict[str, Any] = {"url": webhook_url}
     if WEBHOOK_SECRET:
@@ -255,7 +258,7 @@ def delete_webhook() -> Dict[str, Any]:
 
 
 # =========================================================
-# UI / BUTTONS
+# UI
 # =========================================================
 def inline_keyboard(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
     return {
@@ -323,7 +326,7 @@ def settings_keyboard(chat_id: int) -> Dict[str, Any]:
 def analysis_keyboard(signal_id: str) -> Dict[str, Any]:
     return inline_keyboard([
         [("📱 Exécution rapide", f"signal:quick:{signal_id}")],
-        [("🕓 Sauver dans l’historique", f"signal:history:{signal_id}")],
+        [("🕓 Déjà dans l’historique", f"signal:history:{signal_id}")],
         [("🏠 Menu", "menu:home")]
     ])
 
@@ -367,8 +370,10 @@ def toggle_auto_scan(chat_id: int) -> bool:
     row = conn.execute("SELECT auto_scan_enabled FROM users WHERE chat_id = ?", (chat_id,)).fetchone()
     current = int(row["auto_scan_enabled"]) if row else 0
     new_value = 0 if current == 1 else 1
-    conn.execute("UPDATE users SET auto_scan_enabled = ?, updated_at = ? WHERE chat_id = ?",
-                 (new_value, now_ts(), chat_id))
+    conn.execute(
+        "UPDATE users SET auto_scan_enabled = ?, updated_at = ? WHERE chat_id = ?",
+        (new_value, now_ts(), chat_id)
+    )
     conn.commit()
     conn.close()
     return bool(new_value)
@@ -421,27 +426,70 @@ def toggle_watch_symbol(chat_id: int, symbol: str) -> bool:
 
 
 # =========================================================
-# BINANCE DATA
+# MARKET DATA
 # =========================================================
-def fetch_klines(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = DEFAULT_LIMIT) -> List[Dict[str, float]]:
-    url = f"{BINANCE_BASE_URL}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    raw = resp.json()
+def http_get_json(url: str, params: Dict[str, Any]) -> Any:
+    resp = requests.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": "LVBXNT_Crypto_Bot/1.1"}
+    )
 
-    candles = []
-    for item in raw:
-        candles.append({
-            "open_time": int(item[0]),
-            "open": float(item[1]),
-            "high": float(item[2]),
-            "low": float(item[3]),
-            "close": float(item[4]),
-            "volume": float(item[5]),
-            "close_time": int(item[6]),
-        })
-    return candles
+    content_type = resp.headers.get("Content-Type", "")
+    text_preview = resp.text[:500]
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code} from market API: {text_preview}")
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"Réponse non JSON depuis market API: {content_type} | {text_preview}")
+
+    if isinstance(data, dict) and data.get("code") not in (None, 0):
+        raise RuntimeError(f"Erreur API marché: {data}")
+
+    return data
+
+
+def fetch_klines(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = DEFAULT_LIMIT) -> List[Dict[str, float]]:
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    urls = [
+        f"{BINANCE_BASE_URL}/api/v3/klines",
+        f"{BINANCE_FALLBACK_URL}/api/v3/klines",
+    ]
+
+    last_error = None
+
+    for url in urls:
+        try:
+            raw = http_get_json(url, params)
+            if not isinstance(raw, list) or len(raw) < 20:
+                raise RuntimeError(f"Données insuffisantes depuis {url}: {str(raw)[:300]}")
+
+            candles = []
+            for item in raw:
+                if not isinstance(item, list) or len(item) < 7:
+                    raise RuntimeError(f"Format de bougie invalide depuis {url}: {str(item)[:200]}")
+                candles.append({
+                    "open_time": int(item[0]),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                    "close_time": int(item[6]),
+                })
+
+            logger.info("Market data OK for %s via %s", symbol, url)
+            return candles
+
+        except Exception as e:
+            last_error = e
+            logger.warning("Market fetch failed for %s via %s -> %s", symbol, url, str(e))
+
+    raise RuntimeError(f"Impossible de récupérer les données pour {symbol}: {last_error}")
 
 
 # =========================================================
@@ -450,6 +498,9 @@ def fetch_klines(symbol: str, interval: str = DEFAULT_INTERVAL, limit: int = DEF
 def ema(values: List[float], period: int) -> List[float]:
     if not values:
         return []
+    if len(values) < 2:
+        return values[:]
+
     k = 2 / (period + 1)
     result = [values[0]]
     for price in values[1:]:
@@ -458,11 +509,12 @@ def ema(values: List[float], period: int) -> List[float]:
 
 
 def rsi(values: List[float], period: int = 14) -> List[float]:
-    if len(values) < period + 1:
+    if len(values) < period + 2:
         return [50.0 for _ in values]
 
-    gains = []
-    losses = []
+    gains: List[float] = []
+    losses: List[float] = []
+
     for i in range(1, len(values)):
         diff = values[i] - values[i - 1]
         gains.append(max(diff, 0.0))
@@ -483,6 +535,7 @@ def rsi(values: List[float], period: int = 14) -> List[float]:
 
     while len(rsis) < len(values):
         rsis.insert(0, 50.0)
+
     return rsis[:len(values)]
 
 
@@ -498,18 +551,23 @@ def atr(candles: List[Dict[str, float]], period: int = 14) -> List[float]:
         tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
         trs.append(tr)
 
-    result = []
-    first = sum(trs[1:period + 1]) / period if len(trs) > period else sum(trs[1:]) / max(1, len(trs) - 1)
-    for i in range(period):
-        result.append(first)
-    prev_atr = first
+    if len(trs) <= period:
+        avg = sum(trs[1:]) / max(1, len(trs) - 1)
+        return [avg for _ in candles]
 
+    result = []
+    first = sum(trs[1:period + 1]) / period
+    for _ in range(period):
+        result.append(first)
+
+    prev_atr = first
     for i in range(period, len(trs)):
         prev_atr = ((prev_atr * (period - 1)) + trs[i]) / period
         result.append(prev_atr)
 
     while len(result) < len(candles):
         result.insert(0, first)
+
     return result[:len(candles)]
 
 
@@ -544,12 +602,31 @@ def grade_from_score(score: int) -> str:
     return "D"
 
 
-def risk_reward(entry: float, stop: float, target: float, signal_type: str) -> float:
+def risk_reward(entry: float, stop: float, target: float) -> float:
     risk = abs(entry - stop)
     reward = abs(target - entry)
     if risk <= 0:
         return 0.0
     return reward / risk
+
+
+def build_summary(signal_type: str, trend: str, momentum: str, rsi_value: float, ema_spread_pct: float, score: int) -> str:
+    if signal_type == "BUY":
+        return (
+            f"Setup acheteur détecté : tendance {trend.lower()}, momentum {momentum.lower()}, "
+            f"RSI à {rsi_value:.1f}, structure EMA propre ({ema_spread_pct:.2f}% d’écart). "
+            f"Score global {score}/100."
+        )
+    if signal_type == "SELL":
+        return (
+            f"Setup vendeur détecté : tendance {trend.lower()}, momentum {momentum.lower()}, "
+            f"RSI à {rsi_value:.1f}, structure EMA propre ({ema_spread_pct:.2f}% d’écart). "
+            f"Score global {score}/100."
+        )
+    return (
+        f"Pas de setup assez propre pour l’instant : tendance {trend.lower()}, momentum {momentum.lower()}, "
+        f"RSI à {rsi_value:.1f}. Le filtre premium préfère attendre."
+    )
 
 
 def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_INTERVAL) -> Dict[str, Any]:
@@ -558,42 +635,45 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
 
     candles = fetch_klines(symbol, interval=interval, limit=DEFAULT_LIMIT)
     if len(candles) < 60:
-        return {"ok": False, "error": "Pas assez de données"}
+        raise RuntimeError(f"Pas assez de données pour {symbol} ({len(candles)})")
 
     closes = [c["close"] for c in candles]
     highs = [c["high"] for c in candles]
     lows = [c["low"] for c in candles]
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    rsi14 = rsi(closes, 14)
-    atr14 = atr(candles, 14)
+    ema20_values = ema(closes, 20)
+    ema50_values = ema(closes, 50)
+    rsi14_values = rsi(closes, 14)
+    atr14_values = atr(candles, 14)
+
+    if not (ema20_values and ema50_values and rsi14_values and atr14_values):
+        raise RuntimeError("Indicateurs incomplets")
 
     price = closes[-1]
     prev_price = closes[-2]
-    current_ema20 = ema20[-1]
-    prev_ema20 = ema20[-2]
-    current_ema50 = ema50[-1]
-    current_rsi = rsi14[-1]
-    current_atr = atr14[-1] if atr14[-1] > 0 else max(price * 0.008, 0.0001)
+    current_ema20 = ema20_values[-1]
+    prev_ema20 = ema20_values[-2]
+    current_ema50 = ema50_values[-1]
+    current_rsi = rsi14_values[-1]
+    current_atr = atr14_values[-1] if atr14_values[-1] > 0 else max(price * 0.008, 0.0001)
 
-    ema_spread_pct = abs(current_ema20 - current_ema50) / price * 100
-    price_vs_ema20_pct = (price - current_ema20) / price * 100
+    ema_spread_pct = abs(current_ema20 - current_ema50) / max(price, 1e-10) * 100
+    price_vs_ema20_pct = (price - current_ema20) / max(price, 1e-10) * 100
     ema20_slope = current_ema20 - prev_ema20
     recent_high = max(highs[-20:])
     recent_low = min(lows[-20:])
 
-    momentum_up = price > prev_price and closes[-1] > closes[-3] > closes[-5]
-    momentum_down = price < prev_price and closes[-1] < closes[-3] < closes[-5]
+    momentum_up = len(closes) >= 6 and price > prev_price and closes[-1] > closes[-3] > closes[-5]
+    momentum_down = len(closes) >= 6 and price < prev_price and closes[-1] < closes[-3] < closes[-5]
 
     trend_bull = price > current_ema20 > current_ema50 and ema20_slope > 0
     trend_bear = price < current_ema20 < current_ema50 and ema20_slope < 0
 
     cfg = MODE_CONFIG.get(mode, MODE_CONFIG["normal"])
-    reasons = []
+    reasons: List[str] = []
     score = 0
 
-    # Trend score (30)
+    # Trend (30)
     if trend_bull or trend_bear:
         score += 22
         reasons.append("Tendance claire")
@@ -603,17 +683,17 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     else:
         reasons.append("Tendance peu claire")
 
-    # Momentum score (20)
+    # Momentum (20)
     if momentum_up or momentum_down:
         score += 14
         reasons.append("Momentum présent")
-        if abs(price - prev_price) / price * 100 >= 0.25:
+        if abs(price - prev_price) / max(price, 1e-10) * 100 >= 0.25:
             score += 6
             reasons.append("Impulsion exploitable")
     else:
         reasons.append("Momentum faible")
 
-    # RSI score (15)
+    # RSI (15)
     if 52 <= current_rsi <= 68 or 32 <= current_rsi <= 48:
         score += 12
         reasons.append("RSI propre")
@@ -623,18 +703,17 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     else:
         reasons.append("RSI extrême ou peu utile")
 
-    # Structure score (20)
+    # Structure (20)
     if ema_spread_pct >= 0.18:
         score += 8
         reasons.append("Structure correcte")
     if abs(price_vs_ema20_pct) <= 1.2:
         score += 6
         reasons.append("Prix encore exploitable")
-    if (recent_high - recent_low) / price * 100 >= 1.0:
+    if (recent_high - recent_low) / max(price, 1e-10) * 100 >= 1.0:
         score += 6
         reasons.append("Amplitude suffisante")
 
-    # RR potential score (15)
     rr_candidate = 0.0
     candidate_signal = "NO TRADE"
 
@@ -647,7 +726,7 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
         tp1 = entry + risk * 1.2
         tp2 = entry + risk * 2.0
         tp3 = entry + risk * 3.0
-        rr_candidate = risk_reward(entry, stop, tp2, "BUY")
+        rr_candidate = risk_reward(entry, stop, tp2)
 
     elif trend_bear and momentum_down and current_rsi <= cfg["rsi_sell_max"]:
         candidate_signal = "SELL"
@@ -658,7 +737,8 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
         tp1 = entry - risk * 1.2
         tp2 = entry - risk * 2.0
         tp3 = entry - risk * 3.0
-        rr_candidate = risk_reward(entry, stop, tp2, "SELL")
+        rr_candidate = risk_reward(entry, stop, tp2)
+
     else:
         entry = price
         stop = price
@@ -680,9 +760,7 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     grade = grade_from_score(score)
 
     min_score = cfg["min_score_signal"]
-    if candidate_signal == "BUY" and score < min_score:
-        candidate_signal = "NO TRADE"
-    if candidate_signal == "SELL" and score < min_score:
+    if candidate_signal in ("BUY", "SELL") and score < min_score:
         candidate_signal = "NO TRADE"
 
     if ema_spread_pct < 0.08:
@@ -694,7 +772,7 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
     if abs(price_vs_ema20_pct) > 2.5:
         candidate_signal = "NO TRADE"
         reasons.append("Prix trop étendu")
-    if current_atr / price * 100 < 0.25:
+    if current_atr / max(price, 1e-10) * 100 < 0.25:
         reasons.append("Volatilité faible")
 
     trend_label = "Haussière" if trend_bull else "Baissière" if trend_bear else "Neutre"
@@ -724,7 +802,7 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
         "score": score,
         "grade": grade,
         "mode": mode,
-        "market_price": price,
+        "market_price": safe_round(price),
         "entry_price": safe_round(entry),
         "stop_loss": safe_round(stop),
         "tp1": safe_round(tp1),
@@ -743,25 +821,6 @@ def analyze_symbol(symbol: str, mode: str = "normal", interval: str = DEFAULT_IN
             "reasons": reasons[:8],
         },
     }
-
-
-def build_summary(signal_type: str, trend: str, momentum: str, rsi_value: float, ema_spread_pct: float, score: int) -> str:
-    if signal_type == "BUY":
-        return (
-            f"Setup acheteur détecté : tendance {trend.lower()}, momentum {momentum.lower()}, "
-            f"RSI à {rsi_value:.1f}, structure EMA propre ({ema_spread_pct:.2f}% d’écart). "
-            f"Score global {score}/100."
-        )
-    if signal_type == "SELL":
-        return (
-            f"Setup vendeur détecté : tendance {trend.lower()}, momentum {momentum.lower()}, "
-            f"RSI à {rsi_value:.1f}, structure EMA propre ({ema_spread_pct:.2f}% d’écart). "
-            f"Score global {score}/100."
-        )
-    return (
-        f"Pas de setup assez propre pour l’instant : tendance {trend.lower()}, momentum {momentum.lower()}, "
-        f"RSI à {rsi_value:.1f}. Le filtre premium préfère attendre."
-    )
 
 
 # =========================================================
@@ -848,39 +907,30 @@ def signal_emoji(signal_type: str) -> str:
     }.get(signal_type, "⚪")
 
 
+def compute_trade_risk_percent(entry: float, stop: float) -> float:
+    if entry == 0:
+        return 0.0
+    return abs(entry - stop) / entry * 100
+
+
 def format_signal_message(signal_id: str, row_or_analysis: Any, is_preview: bool = False) -> str:
-    if isinstance(row_or_analysis, sqlite3.Row):
-        signal_type = row_or_analysis["signal_type"]
-        score = row_or_analysis["score"]
-        grade = row_or_analysis["grade"]
-        symbol = row_or_analysis["symbol"]
-        timeframe = row_or_analysis["timeframe"]
-        trend = row_or_analysis["trend"]
-        momentum = row_or_analysis["momentum"]
-        entry = row_or_analysis["entry_price"]
-        sl = row_or_analysis["stop_loss"]
-        tp1 = row_or_analysis["tp1"]
-        tp2 = row_or_analysis["tp2"]
-        tp3 = row_or_analysis["tp3"]
-        summary = row_or_analysis["summary"]
-        mode = row_or_analysis["mode"]
-        market_price = row_or_analysis["market_price"]
-    else:
-        signal_type = row_or_analysis["signal_type"]
-        score = row_or_analysis["score"]
-        grade = row_or_analysis["grade"]
-        symbol = row_or_analysis["symbol"]
-        timeframe = row_or_analysis["timeframe"]
-        trend = row_or_analysis["trend"]
-        momentum = row_or_analysis["momentum"]
-        entry = row_or_analysis["entry_price"]
-        sl = row_or_analysis["stop_loss"]
-        tp1 = row_or_analysis["tp1"]
-        tp2 = row_or_analysis["tp2"]
-        tp3 = row_or_analysis["tp3"]
-        summary = row_or_analysis["summary"]
-        mode = row_or_analysis["mode"]
-        market_price = row_or_analysis["market_price"]
+    data = dict(row_or_analysis) if isinstance(row_or_analysis, sqlite3.Row) else row_or_analysis
+
+    signal_type = data["signal_type"]
+    score = data["score"]
+    grade = data["grade"]
+    symbol = data["symbol"]
+    timeframe = data["timeframe"]
+    trend = data["trend"]
+    momentum = data["momentum"]
+    entry = data["entry_price"]
+    sl = data["stop_loss"]
+    tp1 = data["tp1"]
+    tp2 = data["tp2"]
+    tp3 = data["tp3"]
+    summary = data["summary"]
+    mode = data["mode"]
+    market_price = data["market_price"]
 
     verdict = (
         "Setup premium exploitable."
@@ -896,22 +946,22 @@ def format_signal_message(signal_id: str, row_or_analysis: Any, is_preview: bool
 
     return (
         f"{header}\n\n"
-        f"🪙 <b>Crypto :</b> {html.escape(symbol)}\n"
-        f"{signal_emoji(signal_type)} <b>Signal :</b> {html.escape(signal_type)}\n"
-        f"🏷️ <b>Setup Grade :</b> {html.escape(grade)}\n"
+        f"🪙 <b>Crypto :</b> {html.escape(str(symbol))}\n"
+        f"{signal_emoji(signal_type)} <b>Signal :</b> {html.escape(str(signal_type))}\n"
+        f"🏷️ <b>Setup Grade :</b> {html.escape(str(grade))}\n"
         f"📊 <b>Score :</b> {score}/100\n"
-        f"⏱️ <b>Timeframe :</b> {html.escape(timeframe)}\n"
+        f"⏱️ <b>Timeframe :</b> {html.escape(str(timeframe))}\n"
         f"⚙️ <b>Mode :</b> {html.escape(MODE_CONFIG.get(mode, MODE_CONFIG['normal'])['label'])}\n\n"
-        f"📈 <b>Tendance :</b> {html.escape(trend)}\n"
-        f"⚡ <b>Momentum :</b> {html.escape(momentum)}\n"
+        f"📈 <b>Tendance :</b> {html.escape(str(trend))}\n"
+        f"⚡ <b>Momentum :</b> {html.escape(str(momentum))}\n"
         f"💵 <b>Prix actuel :</b> {market_price}\n\n"
         f"🎯 <b>Entry :</b> {entry}\n"
         f"🛑 <b>Stop Loss :</b> {sl}\n"
         f"🥇 <b>TP1 :</b> {tp1}\n"
         f"🥈 <b>TP2 :</b> {tp2}\n"
         f"🥉 <b>TP3 :</b> {tp3}\n\n"
-        f"📝 <b>Résumé :</b>\n{html.escape(summary)}\n\n"
-        f"✅ <b>Verdict :</b> {html.escape(verdict)}\n"
+        f"📝 <b>Résumé :</b>\n{html.escape(str(summary))}\n\n"
+        f"✅ <b>Verdict :</b> {html.escape(str(verdict))}\n"
         f"🆔 <code>{signal_id}</code>"
     )
 
@@ -940,18 +990,9 @@ def format_quick_execution(row: sqlite3.Row) -> str:
     )
 
 
-def compute_trade_risk_percent(entry: float, stop: float) -> float:
-    if entry == 0:
-        return 0.0
-    return abs(entry - stop) / entry * 100
-
-
 def format_history(rows: List[sqlite3.Row]) -> str:
     if not rows:
-        return (
-            "🕓 <b>Derniers signaux</b>\n\n"
-            "Aucun signal enregistré pour l’instant."
-        )
+        return "🕓 <b>Derniers signaux</b>\n\nAucun signal enregistré pour l’instant."
 
     lines = ["🕓 <b>Derniers signaux</b>\n"]
     for row in rows:
@@ -966,10 +1007,7 @@ def format_history(rows: List[sqlite3.Row]) -> str:
 
 def format_watchlist(chat_id: int) -> str:
     watchlist = get_watchlist(chat_id)
-    if not watchlist:
-        body = "Aucune crypto sélectionnée."
-    else:
-        body = "\n".join([f"• {symbol}" for symbol in watchlist])
+    body = "Aucune crypto sélectionnée." if not watchlist else "\n".join([f"• {symbol}" for symbol in watchlist])
 
     return (
         "📈 <b>Ma Watchlist</b>\n\n"
@@ -1057,7 +1095,7 @@ def run_auto_scan(force: bool = False) -> Dict[str, Any]:
                     alerts_sent += 1
 
                 except Exception as e:
-                    logger.exception("Auto scan failed for %s / %s: %s", chat_id, symbol, e)
+                    logger.exception("Auto scan failed for chat=%s symbol=%s error=%s", chat_id, symbol, e)
 
         set_meta("last_auto_scan_ts", str(now_ts()))
         return {"ok": True, "message": f"Scan terminé, {alerts_sent} alerte(s) envoyée(s)"}
@@ -1066,17 +1104,8 @@ def run_auto_scan(force: bool = False) -> Dict[str, Any]:
 
 
 # =========================================================
-# COMMANDS / TEXT HANDLERS
+# COMMANDS / TEXT
 # =========================================================
-def handle_start(chat_id: int, user_info: Dict[str, Any]) -> None:
-    get_or_create_user(
-        chat_id=chat_id,
-        username=user_info.get("username", ""),
-        first_name=user_info.get("first_name", "")
-    )
-    send_message(chat_id, home_text(), reply_markup=main_menu_keyboard())
-
-
 def handle_menu(chat_id: int) -> None:
     send_message(chat_id, home_text(), reply_markup=main_menu_keyboard())
 
@@ -1090,7 +1119,7 @@ def handle_analyze(chat_id: int, symbol: str) -> None:
         send_message(
             chat_id,
             "⚠️ Symbole non supporté.\n\n"
-            f"✅ Symboles disponibles :\n" + "\n".join([f"• {s}" for s in SUPPORTED_SYMBOLS])
+            "✅ Symboles disponibles :\n" + "\n".join([f"• {s}" for s in SUPPORTED_SYMBOLS])
         )
         return
 
@@ -1098,10 +1127,6 @@ def handle_analyze(chat_id: int, symbol: str) -> None:
 
     try:
         analysis = analyze_symbol(symbol, mode=mode, interval=DEFAULT_INTERVAL)
-        if not analysis.get("ok"):
-            send_message(chat_id, f"❌ Impossible d’analyser {html.escape(symbol)}")
-            return
-
         signal_id = save_signal(chat_id, analysis, is_auto_scan=False)
         send_message(
             chat_id,
@@ -1109,8 +1134,12 @@ def handle_analyze(chat_id: int, symbol: str) -> None:
             reply_markup=analysis_keyboard(signal_id)
         )
     except Exception as e:
-        logger.exception("Analyze failed: %s", e)
-        send_message(chat_id, "❌ Erreur pendant l’analyse. Réessaie dans un instant.")
+        logger.exception("Analyze failed for %s: %s", symbol, e)
+        send_message(
+            chat_id,
+            "❌ Erreur pendant l’analyse.\n\n"
+            "Vérifie que Render a fini de redéployer, puis réessaie dans 10 secondes."
+        )
 
 
 def handle_text_message(chat_id: int, text: str) -> None:
@@ -1151,7 +1180,7 @@ def handle_text_message(chat_id: int, text: str) -> None:
 
 
 # =========================================================
-# CALLBACK HANDLERS
+# CALLBACKS
 # =========================================================
 def handle_callback(callback_query: Dict[str, Any]) -> None:
     callback_id = callback_query["id"]
@@ -1186,12 +1215,7 @@ def handle_callback(callback_query: Dict[str, Any]) -> None:
         if data == "menu:autoscan":
             enabled = toggle_auto_scan(chat_id)
             answer_callback(callback_id, f"Auto Scan {'activé' if enabled else 'désactivé'}")
-            edit_message(
-                chat_id,
-                message_id,
-                format_settings(chat_id),
-                reply_markup=settings_keyboard(chat_id)
-            )
+            edit_message(chat_id, message_id, format_settings(chat_id), reply_markup=settings_keyboard(chat_id))
             return
 
         if data == "menu:watchlist":
@@ -1216,7 +1240,12 @@ def handle_callback(callback_query: Dict[str, Any]) -> None:
 
         if data == "menu:guide":
             answer_callback(callback_id)
-            edit_message(chat_id, message_id, format_guide(), reply_markup=inline_keyboard([[("🏠 Menu", "menu:home")]]))
+            edit_message(
+                chat_id,
+                message_id,
+                format_guide(),
+                reply_markup=inline_keyboard([[("🏠 Menu", "menu:home")]])
+            )
             return
 
         if data.startswith("mode:set:"):
@@ -1264,7 +1293,11 @@ def handle_callback(callback_query: Dict[str, Any]) -> None:
                 answer_callback(callback_id, "Signal introuvable", True)
                 return
             answer_callback(callback_id)
-            send_message(chat_id, format_quick_execution(row), reply_markup=inline_keyboard([[("🏠 Menu", "menu:home")]]))
+            send_message(
+                chat_id,
+                format_quick_execution(row),
+                reply_markup=inline_keyboard([[("🏠 Menu", "menu:home")]])
+            )
             return
 
         if data.startswith("signal:history:"):
@@ -1294,11 +1327,10 @@ def verify_telegram_secret(req) -> bool:
 
 
 def process_update(update: Dict[str, Any]) -> None:
-    # Opportunistic autoscan
     try:
         run_auto_scan(force=False)
-    except Exception:
-        logger.exception("Opportunistic autoscan failed")
+    except Exception as e:
+        logger.warning("Opportunistic autoscan skipped: %s", e)
 
     if "message" in update:
         message = update["message"]
@@ -1309,7 +1341,6 @@ def process_update(update: Dict[str, Any]) -> None:
             username=from_user.get("username", ""),
             first_name=from_user.get("first_name", "")
         )
-
         text = message.get("text", "")
         handle_text_message(chat_id, text)
         return
