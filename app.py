@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import time
-import math
 import uuid
 import requests
 from flask import Flask, request
@@ -23,7 +22,8 @@ SUPPORTED = [
     "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "MATICUSDT"
 ]
 
-DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
+# ✅ Maintenant les 10 cryptos par défaut
+DEFAULT_WATCHLIST = SUPPORTED.copy()
 
 COINGECKO_IDS = {
     "BTCUSDT": "bitcoin",
@@ -279,18 +279,6 @@ def send_message(chat_id, text, keyboard=None):
     tg("sendMessage", payload)
 
 
-def edit_message(chat_id, message_id, text, keyboard=None):
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    tg("editMessageText", payload)
-
-
 def answer_callback(callback_id, text="OK"):
     tg("answerCallbackQuery", {
         "callback_query_id": callback_id,
@@ -302,11 +290,14 @@ def answer_callback(callback_id, text="OK"):
 # =========================================================
 # KEYBOARDS
 # =========================================================
-def main_keyboard():
+def main_keyboard(chat_id):
+    _, autoscan = get_user_settings(chat_id)
+    auto_label = "🚨 Auto Scan ON" if autoscan else "🚨 Auto Scan OFF"
+
     return {
         "inline_keyboard": [
             [{"text": "🧠 Analyse Premium", "callback_data": "analyse"},
-             {"text": "🚨 Auto Scan", "callback_data": "autoscan"}],
+             {"text": auto_label, "callback_data": "autoscan_toggle"}],
             [{"text": "📈 Ma Watchlist", "callback_data": "watchlist"},
              {"text": "🕓 Derniers Signaux", "callback_data": "signals"}],
             [{"text": "⚙️ Réglages Pro", "callback_data": "settings"},
@@ -337,12 +328,12 @@ def watchlist_keyboard(chat_id):
 
     for symbol in SUPPORTED:
         if symbol in wl:
-            rows.append([{"text": f"➖ {symbol}", "callback_data": f"wl_remove_{symbol}"}])
+            rows.append([{"text": f"✅ {symbol}", "callback_data": f"wl_remove_{symbol}"}])
         else:
             rows.append([{"text": f"➕ {symbol}", "callback_data": f"wl_add_{symbol}"}])
 
     rows.append([
-        {"text": "✅ Tout sélectionner", "callback_data": "wl_all"},
+        {"text": "🔥 Tout sélectionner", "callback_data": "wl_all"},
         {"text": "♻️ Reset défaut", "callback_data": "wl_reset"}
     ])
     rows.append([{"text": "🏠 Retour menu", "callback_data": "menu"}])
@@ -354,20 +345,19 @@ def watchlist_keyboard(chat_id):
 # UI
 # =========================================================
 def show_menu(chat_id):
+    mode, autoscan = get_user_settings(chat_id)
     text = (
-        "👑 <b>LVBXNT CRYPTO BOT — V2.4 MONSTER</b> 👑\n\n"
-        "Ton bot crypto premium est prêt.\n\n"
+        "👑 <b>LVBXNT CRYPTO BOT — V2.5 GOD MODE</b> 👑\n\n"
+        "💎 <b>Bot crypto premium prêt à l’action</b>\n\n"
+        f"🤖 Auto Scan : {'ON ✅' if autoscan else 'OFF ❌'}\n"
+        f"🎯 Mode : <b>{mode}</b>\n"
+        f"📈 Watchlist : <b>{len(get_watchlist(chat_id))} cryptos</b>\n\n"
         "💰 <b>Cryptos supportées :</b>\n"
         "BTC • ETH • SOL • XRP • BNB\n"
         "ADA • DOGE • AVAX • LINK • MATIC\n\n"
-        "✅ Analyse Premium\n"
-        "✅ Auto Scan\n"
-        "✅ Watchlist Premium\n"
-        "✅ Réglages Pro\n"
-        "✅ Exécution rapide iPhone\n\n"
         "👇 <b>Choisis une option ou envoie une crypto</b>"
     )
-    send_message(chat_id, text, main_keyboard())
+    send_message(chat_id, text, main_keyboard(chat_id))
 
 
 def show_settings(chat_id):
@@ -386,7 +376,7 @@ def show_settings(chat_id):
 def show_guide(chat_id):
     text = (
         "❓ <b>GUIDE RAPIDE</b>\n\n"
-        "📩 Envoie simplement une crypto supportée :\n"
+        "📩 Envoie une crypto supportée :\n"
         "<code>BTCUSDT</code>\n"
         "<code>ETHUSDT</code>\n"
         "<code>SOLUSDT</code>\n\n"
@@ -395,14 +385,20 @@ def show_guide(chat_id):
         "• Score qualité\n"
         "• Entry / SL / TP1 / TP2 / TP3\n"
         "• Résumé clair du setup\n\n"
-        "📱 Ensuite tu peux copier vite ton setup sur mobile."
+        "🚨 Si Auto Scan est activé :\n"
+        "• le bot peut scanner ta watchlist à la demande\n"
+        "• et te sortir les meilleurs setups"
     )
     send_message(chat_id, text, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
 
 
 def show_watchlist(chat_id):
     wl = get_watchlist(chat_id)
-    text = "📈 <b>MA WATCHLIST PREMIUM</b>\n\n" + "\n".join([f"• {x}" for x in wl])
+    text = (
+        f"📈 <b>MA WATCHLIST PREMIUM</b>\n\n"
+        f"📦 <b>Total :</b> {len(wl)} cryptos\n\n" +
+        "\n".join([f"• {x}" for x in wl])
+    )
     send_message(chat_id, text, watchlist_keyboard(chat_id))
 
 
@@ -820,13 +816,34 @@ def format_execution(data):
     )
 
 
+def format_scan_result(items, mode):
+    if not items:
+        return (
+            f"🚨 <b>AUTO SCAN — {mode}</b>\n\n"
+            "⚪ Aucun setup premium détecté pour l’instant.\n\n"
+            "💡 Reviens plus tard ou change le mode dans Réglages Pro."
+        )
+
+    text = f"🚨 <b>AUTO SCAN — {mode}</b>\n\n"
+    text += "🔥 <b>Meilleurs setups détectés :</b>\n\n"
+
+    for item in items[:5]:
+        text += (
+            f"• <b>{item['symbol']}</b> → {item['signal']} | "
+            f"Score {item['score']}/100 | Grade {item['grade']}\n"
+            f"Entry {item['entry']} | TP1 {item['tp1']} | SL {item['sl']}\n\n"
+        )
+
+    return text
+
+
 # =========================================================
 # BOT ACTIONS
 # =========================================================
 def handle_symbol(chat_id, symbol):
     mode, _ = get_user_settings(chat_id)
 
-    send_message(chat_id, f"⏳ Analyse MONSTER en cours sur <b>{symbol}</b>...")
+    send_message(chat_id, f"⏳ Analyse GOD MODE en cours sur <b>{symbol}</b>...")
 
     data = analyze_symbol(symbol, mode)
     if not data:
@@ -848,6 +865,42 @@ def handle_symbol(chat_id, symbol):
     send_message(chat_id, format_analysis(data), keyboard)
 
 
+def run_autoscan(chat_id):
+    mode, autoscan = get_user_settings(chat_id)
+
+    if not autoscan:
+        send_message(chat_id, "❌ Auto Scan est OFF.\n\nActive-le d’abord depuis le menu.")
+        return
+
+    wl = get_watchlist(chat_id)
+    if not wl:
+        send_message(chat_id, "⚠️ Ta watchlist est vide.")
+        return
+
+    send_message(chat_id, f"🚨 Scan intelligent en cours sur <b>{len(wl)}</b> cryptos...")
+
+    results = []
+
+    for symbol in wl:
+        data = analyze_symbol(symbol, mode)
+        if not data:
+            continue
+
+        if data["signal"] in ["BUY", "SELL"]:
+            if mode == "PRUDENT" and data["score"] >= 72:
+                results.append(data)
+            elif mode == "NORMAL" and data["score"] >= 65:
+                results.append(data)
+            elif mode == "AGGRESSIVE" and data["score"] >= 58:
+                results.append(data)
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    send_message(chat_id, format_scan_result(results, mode), {
+        "inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]
+    })
+
+
 def handle_callback(chat_id, callback_id, data):
     ensure_user(chat_id)
 
@@ -859,11 +912,19 @@ def handle_callback(chat_id, callback_id, data):
         answer_callback(callback_id, "Analyse")
         send_message(chat_id, "📩 Envoie une crypto (ex: BTCUSDT)")
 
-    elif data == "autoscan":
-        answer_callback(callback_id, "Auto Scan")
+    elif data == "autoscan_toggle":
         mode, autoscan = get_user_settings(chat_id)
-        txt = f"🤖 Auto Scan : {'ON ✅' if autoscan else 'OFF ❌'}"
-        send_message(chat_id, txt, main_keyboard())
+        new_value = 0 if autoscan else 1
+        set_autoscan(chat_id, new_value)
+
+        if new_value == 1:
+            answer_callback(callback_id, "Auto Scan ACTIVÉ")
+            send_message(chat_id, "🚨 Auto Scan ACTIVÉ ✅")
+            run_autoscan(chat_id)
+        else:
+            answer_callback(callback_id, "Auto Scan DÉSACTIVÉ")
+            send_message(chat_id, "🚨 Auto Scan DÉSACTIVÉ ❌")
+            show_menu(chat_id)
 
     elif data == "watchlist":
         answer_callback(callback_id, "Watchlist")
@@ -936,7 +997,9 @@ def handle_callback(chat_id, callback_id, data):
                 "tp3": row["tp3"]
             }
             answer_callback(callback_id, "Exécution rapide")
-            send_message(chat_id, format_execution(fake_data), {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
+            send_message(chat_id, format_execution(fake_data), {
+                "inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]
+            })
         else:
             answer_callback(callback_id, "Signal introuvable")
 
@@ -949,7 +1012,7 @@ def handle_callback(chat_id, callback_id, data):
 # =========================================================
 @app.route("/")
 def home():
-    return "LVBXNT CRYPTO BOT V2.4 MONSTER RUNNING"
+    return "LVBXNT CRYPTO BOT V2.5 GOD MODE RUNNING"
 
 
 @app.route("/set_webhook")
