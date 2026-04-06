@@ -61,19 +61,22 @@ KRAKEN_PAIRS = {
     "AVAXUSDT": "AVAXUSD",
     "LINKUSDT": "LINKUSD",
     "MATICUSDT": "MATICUSD"
-    # BNB souvent absent / variable sur Kraken
 }
 
 CACHE = {}
 CACHE_TTL = 180
 
+
 # =========================================================
 # DATABASE
 # =========================================================
 def db():
-    conn = sqlite3.connect("crypto_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("crypto_bot.db", check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
+
 
 def init_db():
     conn = db()
@@ -83,7 +86,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users (
         chat_id TEXT PRIMARY KEY,
         mode TEXT DEFAULT 'NORMAL',
-        autoscan INTEGER DEFAULT 1
+        autoscan INTEGER DEFAULT 0
     )
     """)
 
@@ -113,7 +116,9 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 # =========================================================
 # CACHE
@@ -126,8 +131,10 @@ def cache_get(key):
         return None
     return item["value"]
 
+
 def cache_set(key, value):
     CACHE[key] = {"value": value, "time": time.time()}
+
 
 # =========================================================
 # USER SETTINGS
@@ -139,13 +146,16 @@ def ensure_user(chat_id):
     row = c.fetchone()
 
     if not row:
-        c.execute("INSERT INTO users (chat_id, mode, autoscan) VALUES (?, ?, ?)",
-                  (str(chat_id), "NORMAL", 1))
+        c.execute(
+            "INSERT INTO users (chat_id, mode, autoscan) VALUES (?, ?, ?)",
+            (str(chat_id), "NORMAL", 0)
+        )
         for s in DEFAULT_WATCHLIST:
             c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), s))
         conn.commit()
 
     conn.close()
+
 
 def get_user_settings(chat_id):
     ensure_user(chat_id)
@@ -156,6 +166,7 @@ def get_user_settings(chat_id):
     conn.close()
     return row["mode"], row["autoscan"]
 
+
 def set_user_mode(chat_id, mode):
     ensure_user(chat_id)
     conn = db()
@@ -163,6 +174,7 @@ def set_user_mode(chat_id, mode):
     c.execute("UPDATE users SET mode=? WHERE chat_id=?", (mode, str(chat_id)))
     conn.commit()
     conn.close()
+
 
 def set_autoscan(chat_id, value):
     ensure_user(chat_id)
@@ -172,6 +184,7 @@ def set_autoscan(chat_id, value):
     conn.commit()
     conn.close()
 
+
 def get_watchlist(chat_id):
     ensure_user(chat_id)
     conn = db()
@@ -180,6 +193,45 @@ def get_watchlist(chat_id):
     rows = c.fetchall()
     conn.close()
     return [r["symbol"] for r in rows]
+
+
+def add_to_watchlist(chat_id, symbol):
+    wl = get_watchlist(chat_id)
+    if symbol not in wl:
+        conn = db()
+        c = conn.cursor()
+        c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), symbol))
+        conn.commit()
+        conn.close()
+
+
+def remove_from_watchlist(chat_id, symbol):
+    conn = db()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlists WHERE chat_id=? AND symbol=?", (str(chat_id), symbol))
+    conn.commit()
+    conn.close()
+
+
+def reset_watchlist(chat_id):
+    conn = db()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlists WHERE chat_id=?", (str(chat_id),))
+    for s in DEFAULT_WATCHLIST:
+        c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), s))
+    conn.commit()
+    conn.close()
+
+
+def select_all_watchlist(chat_id):
+    conn = db()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchlists WHERE chat_id=?", (str(chat_id),))
+    for s in SUPPORTED:
+        c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), s))
+    conn.commit()
+    conn.close()
+
 
 def save_signal(chat_id, symbol, signal, score, entry, sl, tp1, tp2, tp3):
     conn = db()
@@ -192,6 +244,7 @@ def save_signal(chat_id, symbol, signal, score, entry, sl, tp1, tp2, tp3):
     conn.commit()
     conn.close()
     return signal_id
+
 
 def get_last_signals(chat_id, limit=5):
     conn = db()
@@ -206,12 +259,14 @@ def get_last_signals(chat_id, limit=5):
     conn.close()
     return rows
 
+
 # =========================================================
 # TELEGRAM
 # =========================================================
 def tg(method, payload):
     url = f"{BASE_URL}/{method}"
-    return requests.post(url, json=payload, timeout=15)
+    return requests.post(url, json=payload, timeout=20)
+
 
 def send_message(chat_id, text, keyboard=None):
     payload = {
@@ -223,6 +278,19 @@ def send_message(chat_id, text, keyboard=None):
         payload["reply_markup"] = keyboard
     tg("sendMessage", payload)
 
+
+def edit_message(chat_id, message_id, text, keyboard=None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    tg("editMessageText", payload)
+
+
 def answer_callback(callback_id, text="OK"):
     tg("answerCallbackQuery", {
         "callback_query_id": callback_id,
@@ -230,54 +298,77 @@ def answer_callback(callback_id, text="OK"):
         "show_alert": False
     })
 
+
 # =========================================================
 # KEYBOARDS
 # =========================================================
 def main_keyboard():
     return {
         "inline_keyboard": [
-            [{"text":"🧠 Analyse Premium","callback_data":"analyse"},
-             {"text":"🚨 Auto Scan","callback_data":"autoscan"}],
-            [{"text":"📈 Ma Watchlist","callback_data":"watchlist"},
-             {"text":"🕓 Derniers Signaux","callback_data":"signals"}],
-            [{"text":"⚙️ Réglages Pro","callback_data":"settings"},
-             {"text":"❓ Guide Rapide","callback_data":"guide"}]
+            [{"text": "🧠 Analyse Premium", "callback_data": "analyse"},
+             {"text": "🚨 Auto Scan", "callback_data": "autoscan"}],
+            [{"text": "📈 Ma Watchlist", "callback_data": "watchlist"},
+             {"text": "🕓 Derniers Signaux", "callback_data": "signals"}],
+            [{"text": "⚙️ Réglages Pro", "callback_data": "settings"},
+             {"text": "❓ Guide Rapide", "callback_data": "guide"}]
         ]
     }
 
+
 def settings_keyboard(chat_id):
     mode, autoscan = get_user_settings(chat_id)
-    auto_label = "✅ Auto Scan ON" if autoscan else "❌ Auto Scan OFF"
+    auto_label = "❌ Auto Scan OFF" if autoscan == 0 else "✅ Auto Scan ON"
 
     return {
         "inline_keyboard": [
             [{"text": auto_label, "callback_data": "toggle_autoscan"}],
-            [{"text":"🛡️ Prudent","callback_data":"mode_PRUDENT"},
-             {"text":"⚖️ Normal","callback_data":"mode_NORMAL"},
-             {"text":"⚡ Agressif","callback_data":"mode_AGGRESSIVE"}],
-            [{"text":f"🎯 Mode actuel : {mode}", "callback_data":"noop"}],
-            [{"text":"🏠 Retour menu","callback_data":"menu"}]
+            [{"text": "🛡️ Prudent", "callback_data": "mode_PRUDENT"},
+             {"text": "⚖️ Normal", "callback_data": "mode_NORMAL"},
+             {"text": "⚡ Agressif", "callback_data": "mode_AGGRESSIVE"}],
+            [{"text": f"🎯 Mode actuel : {mode}", "callback_data": "noop"}],
+            [{"text": "🏠 Retour menu", "callback_data": "menu"}]
         ]
     }
+
+
+def watchlist_keyboard(chat_id):
+    wl = get_watchlist(chat_id)
+    rows = []
+
+    for symbol in SUPPORTED:
+        if symbol in wl:
+            rows.append([{"text": f"➖ {symbol}", "callback_data": f"wl_remove_{symbol}"}])
+        else:
+            rows.append([{"text": f"➕ {symbol}", "callback_data": f"wl_add_{symbol}"}])
+
+    rows.append([
+        {"text": "✅ Tout sélectionner", "callback_data": "wl_all"},
+        {"text": "♻️ Reset défaut", "callback_data": "wl_reset"}
+    ])
+    rows.append([{"text": "🏠 Retour menu", "callback_data": "menu"}])
+
+    return {"inline_keyboard": rows}
+
 
 # =========================================================
 # UI
 # =========================================================
 def show_menu(chat_id):
     text = (
-        "👑 <b>LVBXNT CRYPTO BOT — V2.3 ULTRA PRO</b> 👑\n\n"
+        "👑 <b>LVBXNT CRYPTO BOT — V2.4 MONSTER</b> 👑\n\n"
         "Ton bot crypto premium est prêt.\n\n"
         "💰 <b>Cryptos supportées :</b>\n"
         "BTC • ETH • SOL • XRP • BNB\n"
         "ADA • DOGE • AVAX • LINK • MATIC\n\n"
         "✅ Analyse Premium\n"
         "✅ Auto Scan\n"
-        "✅ Watchlist\n"
+        "✅ Watchlist Premium\n"
         "✅ Réglages Pro\n"
         "✅ Exécution rapide iPhone\n\n"
         "👇 <b>Choisis une option ou envoie une crypto</b>"
     )
     send_message(chat_id, text, main_keyboard())
+
 
 def show_settings(chat_id):
     mode, autoscan = get_user_settings(chat_id)
@@ -290,6 +381,7 @@ def show_settings(chat_id):
         "⚡ <b>Agressif</b> = plus d'opportunités"
     )
     send_message(chat_id, text, settings_keyboard(chat_id))
+
 
 def show_guide(chat_id):
     text = (
@@ -305,17 +397,19 @@ def show_guide(chat_id):
         "• Résumé clair du setup\n\n"
         "📱 Ensuite tu peux copier vite ton setup sur mobile."
     )
-    send_message(chat_id, text, {"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"menu"}]]})
+    send_message(chat_id, text, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
+
 
 def show_watchlist(chat_id):
     wl = get_watchlist(chat_id)
-    text = "📈 <b>MA WATCHLIST</b>\n\n" + "\n".join([f"• {x}" for x in wl])
-    send_message(chat_id, text, {"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"menu"}]]})
+    text = "📈 <b>MA WATCHLIST PREMIUM</b>\n\n" + "\n".join([f"• {x}" for x in wl])
+    send_message(chat_id, text, watchlist_keyboard(chat_id))
+
 
 def show_signals(chat_id):
     rows = get_last_signals(chat_id, 5)
     if not rows:
-        send_message(chat_id, "🕓 Aucun signal récent.", {"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"menu"}]]})
+        send_message(chat_id, "🕓 Aucun signal récent.", {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
         return
 
     text = "🕓 <b>DERNIERS SIGNAUX</b>\n\n"
@@ -324,7 +418,8 @@ def show_signals(chat_id):
             f"• <b>{r['symbol']}</b> — {r['signal']} — Score {r['score']}/100\n"
             f"Entry {r['entry']} | SL {r['sl']} | TP1 {r['tp1']}\n\n"
         )
-    send_message(chat_id, text, {"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"menu"}]]})
+    send_message(chat_id, text, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
+
 
 # =========================================================
 # DATA SOURCES
@@ -360,7 +455,7 @@ def fetch_from_kraken(symbol):
             return None
 
         candles = result.get(key, [])
-        prices = [float(c[4]) for c in candles][-120:]  # close
+        prices = [float(c[4]) for c in candles][-120:]
         if len(prices) < 30:
             return None
 
@@ -368,6 +463,7 @@ def fetch_from_kraken(symbol):
         return prices
     except:
         return None
+
 
 def fetch_from_coinmarketcap(symbol):
     cache_key = f"cmc_{symbol}"
@@ -405,6 +501,7 @@ def fetch_from_coinmarketcap(symbol):
     except:
         return None
 
+
 def fetch_from_coingecko(symbol):
     cache_key = f"cg_{symbol}"
     cached = cache_get(cache_key)
@@ -431,6 +528,7 @@ def fetch_from_coingecko(symbol):
     except:
         return None
 
+
 def fetch_from_coinpaprika(symbol):
     cache_key = f"paprika_{symbol}"
     cached = cache_get(cache_key)
@@ -456,6 +554,7 @@ def fetch_from_coinpaprika(symbol):
         return prices
     except:
         return None
+
 
 def fetch_from_dexscreener(symbol):
     cache_key = f"dex_{symbol}"
@@ -490,6 +589,7 @@ def fetch_from_dexscreener(symbol):
     except:
         return None
 
+
 def fetch_social_sentiment(symbol):
     cache_key = f"st_{symbol}"
     cached = cache_get(cache_key)
@@ -523,6 +623,7 @@ def fetch_social_sentiment(symbol):
     except:
         return {"sentiment": "NEUTRE", "activity": "Faible"}
 
+
 def get_prices(symbol):
     sources = [
         fetch_from_kraken,
@@ -539,6 +640,7 @@ def get_prices(symbol):
 
     return None
 
+
 # =========================================================
 # INDICATORS
 # =========================================================
@@ -550,6 +652,7 @@ def ema(values, period):
     for price in values[period:]:
         e = price * k + e * (1 - k)
     return e
+
 
 def rsi(values, period=14):
     if len(values) < period + 1:
@@ -575,6 +678,7 @@ def rsi(values, period=14):
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
 
 # =========================================================
 # ANALYSIS ENGINE
@@ -635,24 +739,24 @@ def analyze_symbol(symbol, mode="NORMAL"):
 
     if score >= buy_threshold:
         signal = "BUY"
-        sl = round(current * 0.98, 4)
-        tp1 = round(current * 1.02, 4)
-        tp2 = round(current * 1.04, 4)
-        tp3 = round(current * 1.06, 4)
+        sl = round(current * 0.98, 6)
+        tp1 = round(current * 1.02, 6)
+        tp2 = round(current * 1.04, 6)
+        tp3 = round(current * 1.06, 6)
         grade = "A+" if score >= 82 else "A" if score >= 72 else "B+"
     elif score <= sell_threshold:
         signal = "SELL"
-        sl = round(current * 1.02, 4)
-        tp1 = round(current * 0.98, 4)
-        tp2 = round(current * 0.96, 4)
-        tp3 = round(current * 0.94, 4)
+        sl = round(current * 1.02, 6)
+        tp1 = round(current * 0.98, 6)
+        tp2 = round(current * 0.96, 6)
+        tp3 = round(current * 0.94, 6)
         grade = "A+" if score <= 18 else "A" if score <= 28 else "B+"
     else:
         signal = "NO TRADE"
-        sl = round(current * 0.99, 4)
-        tp1 = round(current * 1.01, 4)
-        tp2 = round(current * 1.02, 4)
-        tp3 = round(current * 1.03, 4)
+        sl = round(current * 0.99, 6)
+        tp1 = round(current * 1.01, 6)
+        tp2 = round(current * 1.02, 6)
+        tp3 = round(current * 1.03, 6)
         grade = "C"
 
     social = fetch_social_sentiment(symbol)
@@ -664,18 +768,19 @@ def analyze_symbol(symbol, mode="NORMAL"):
         "grade": grade,
         "trend": trend,
         "momentum": momentum,
-        "price": round(current, 4),
-        "entry": round(current, 4),
+        "price": round(current, 6),
+        "entry": round(current, 6),
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
         "rsi": round(rsi_val, 2),
-        "ema20": round(ema20_val, 4),
-        "ema50": round(ema50_val, 4),
+        "ema20": round(ema20_val, 6),
+        "ema50": round(ema50_val, 6),
         "social_sentiment": social["sentiment"],
         "social_activity": social["activity"]
     }
+
 
 def format_analysis(data):
     verdict = "✅ Setup propre" if data["signal"] != "NO TRADE" else "⚪ Marché pas assez propre"
@@ -701,6 +806,7 @@ def format_analysis(data):
         f"{verdict}"
     )
 
+
 def format_execution(data):
     return (
         f"📱 <b>EXÉCUTION RAPIDE — {data['symbol']}</b>\n\n"
@@ -713,13 +819,14 @@ def format_execution(data):
         f"⭐ Score : {data['score']}/100"
     )
 
+
 # =========================================================
 # BOT ACTIONS
 # =========================================================
 def handle_symbol(chat_id, symbol):
     mode, _ = get_user_settings(chat_id)
 
-    send_message(chat_id, f"⏳ Analyse ULTRA PRO en cours sur <b>{symbol}</b>...")
+    send_message(chat_id, f"⏳ Analyse MONSTER en cours sur <b>{symbol}</b>...")
 
     data = analyze_symbol(symbol, mode)
     if not data:
@@ -733,12 +840,13 @@ def handle_symbol(chat_id, symbol):
 
     keyboard = {
         "inline_keyboard": [
-            [{"text":"📱 Exécution rapide","callback_data":f"exec_{signal_id}"}],
-            [{"text":"🏠 Menu","callback_data":"menu"}]
+            [{"text": "📱 Exécution rapide", "callback_data": f"exec_{signal_id}"}],
+            [{"text": "🏠 Menu", "callback_data": "menu"}]
         ]
     }
 
     send_message(chat_id, format_analysis(data), keyboard)
+
 
 def handle_callback(chat_id, callback_id, data):
     ensure_user(chat_id)
@@ -754,7 +862,7 @@ def handle_callback(chat_id, callback_id, data):
     elif data == "autoscan":
         answer_callback(callback_id, "Auto Scan")
         mode, autoscan = get_user_settings(chat_id)
-        txt = "🤖 Auto Scan activé." if autoscan else "🤖 Auto Scan désactivé."
+        txt = f"🤖 Auto Scan : {'ON ✅' if autoscan else 'OFF ❌'}"
         send_message(chat_id, txt, main_keyboard())
 
     elif data == "watchlist":
@@ -786,6 +894,28 @@ def handle_callback(chat_id, callback_id, data):
         answer_callback(callback_id, f"Mode {new_mode}")
         show_settings(chat_id)
 
+    elif data.startswith("wl_add_"):
+        symbol = data.replace("wl_add_", "")
+        add_to_watchlist(chat_id, symbol)
+        answer_callback(callback_id, f"{symbol} ajouté")
+        show_watchlist(chat_id)
+
+    elif data.startswith("wl_remove_"):
+        symbol = data.replace("wl_remove_", "")
+        remove_from_watchlist(chat_id, symbol)
+        answer_callback(callback_id, f"{symbol} retiré")
+        show_watchlist(chat_id)
+
+    elif data == "wl_all":
+        select_all_watchlist(chat_id)
+        answer_callback(callback_id, "Toutes les cryptos ajoutées")
+        show_watchlist(chat_id)
+
+    elif data == "wl_reset":
+        reset_watchlist(chat_id)
+        answer_callback(callback_id, "Watchlist remise par défaut")
+        show_watchlist(chat_id)
+
     elif data.startswith("exec_"):
         signal_id = data.replace("exec_", "")
         conn = db()
@@ -806,19 +936,21 @@ def handle_callback(chat_id, callback_id, data):
                 "tp3": row["tp3"]
             }
             answer_callback(callback_id, "Exécution rapide")
-            send_message(chat_id, format_execution(fake_data), {"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"menu"}]]})
+            send_message(chat_id, format_execution(fake_data), {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
         else:
             answer_callback(callback_id, "Signal introuvable")
 
     else:
         answer_callback(callback_id, "OK")
 
+
 # =========================================================
 # ROUTES
 # =========================================================
 @app.route("/")
 def home():
-    return "LVBXNT CRYPTO BOT V2.3 ULTRA PRO RUNNING"
+    return "LVBXNT CRYPTO BOT V2.4 MONSTER RUNNING"
+
 
 @app.route("/set_webhook")
 def set_webhook():
@@ -829,10 +961,12 @@ def set_webhook():
     r = requests.get(f"{BASE_URL}/setWebhook?url={webhook_url}")
     return r.text
 
+
 @app.route("/delete_webhook")
 def delete_webhook():
     r = requests.get(f"{BASE_URL}/deleteWebhook")
     return r.text
+
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
@@ -861,6 +995,7 @@ def telegram_webhook():
         handle_callback(chat_id, callback_id, callback_data)
 
     return "ok", 200
+
 
 # =========================================================
 # RUN
