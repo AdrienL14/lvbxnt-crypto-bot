@@ -87,6 +87,12 @@ MODE_CONFIG = {
         "sell_rsi": 49,
         "min_auto_score": 64,
         "display_name": "Agressif ⚡"
+    },
+    "sniper": {
+        "buy_rsi": 60,
+        "sell_rsi": 40,
+        "min_auto_score": 86,
+        "display_name": "Sniper 🔥"
     }
 }
 
@@ -416,6 +422,9 @@ def settings_menu(chat_id):
                 {"text": "⚖️ Normal", "callback_data": "mode:normal"},
                 {"text": "⚡ Agressif", "callback_data": "mode:aggressive"}
             ],
+            [
+                {"text": "🔥 Sniper", "callback_data": "mode:sniper"}
+            ],
             [{"text": f"🎯 Mode actuel: {MODE_CONFIG[mode]['display_name']}", "callback_data": "noop"}],
             [{"text": "🔙 Retour menu", "callback_data": "back_main"}]
         ]
@@ -713,21 +722,21 @@ def atr_like(closes, lookback=14):
 
 def detect_momentum(rsi_value, direction):
     if direction == "BUY":
-        if rsi_value >= 65:
+        if rsi_value >= 68:
             return "STRONG"
-        if rsi_value >= 56:
+        if rsi_value >= 58:
             return "GOOD"
         return "WEAK"
     if direction == "SELL":
-        if rsi_value <= 35:
+        if rsi_value <= 32:
             return "STRONG"
-        if rsi_value <= 44:
+        if rsi_value <= 42:
             return "GOOD"
         return "WEAK"
     return "NEUTRAL"
 
 
-def score_signal(price, ema20_value, ema50_value, rsi_value, direction, volatility):
+def score_signal(price, ema20_value, ema50_value, rsi_value, direction, volatility, mode):
     score = 45
     distance_pct = abs(ema20_value - ema50_value) / max(abs(price), 0.00001)
 
@@ -769,6 +778,17 @@ def score_signal(price, ema20_value, ema50_value, rsi_value, direction, volatili
         score += 5
     elif session == "OFF_HOURS":
         score -= 5
+
+    if mode == "sniper":
+        if distance_pct >= 0.02:
+            score += 6
+        else:
+            score -= 10
+
+        if direction == "BUY" and rsi_value < 60:
+            score -= 10
+        if direction == "SELL" and rsi_value > 40:
+            score -= 10
 
     return max(0, min(97, int(score)))
 
@@ -818,8 +838,17 @@ def analyze_symbol(symbol, mode="normal"):
             trend = "NEUTRAL"
             summary = "Le marché n'offre pas un setup suffisamment propre."
 
+        if mode == "sniper" and direction != "NO TRADE":
+            ema_gap = abs(ema20_value - ema50_value) / max(abs(price), 0.00001)
+            momentum = detect_momentum(rsi_value, direction)
+
+            if ema_gap < 0.015 or momentum == "WEAK":
+                direction = "NO TRADE"
+                trend = "NEUTRAL"
+                summary = "Mode Sniper : setup refusé car pas assez propre."
+
         score = 40 if direction == "NO TRADE" else score_signal(
-            price, ema20_value, ema50_value, rsi_value, direction, volatility
+            price, ema20_value, ema50_value, rsi_value, direction, volatility, mode
         )
         momentum = detect_momentum(rsi_value, direction if direction != "NO TRADE" else "BUY")
         grade = setup_grade(score)
@@ -932,7 +961,7 @@ def format_signal(sig):
 
     if sig["direction"] == "NO TRADE":
         return (
-            f"👑 *LVBXNT CRYPTO BOT — V3 REAL AI* 👑\n\n"
+            f"👑 *LVBXNT CRYPTO BOT — V3.1 SNIPER MODE* 👑\n\n"
             f"💰 *Crypto:* `{sig['symbol']}`\n"
             f"⚠️ *Signal:* *NO TRADE*\n"
             f"🏆 *Setup Grade:* `{sig['grade']}`\n"
@@ -954,7 +983,7 @@ def format_signal(sig):
         )
 
     return (
-        f"👑 *LVBXNT CRYPTO BOT — V3 REAL AI* 👑\n\n"
+        f"👑 *LVBXNT CRYPTO BOT — V3.1 SNIPER MODE* 👑\n\n"
         f"💰 *Crypto:* `{sig['symbol']}`\n"
         f"🚦 *Signal:* *{sig['direction']}*\n"
         f"🏆 *Setup Grade:* `{sig['grade']}`\n"
@@ -1032,7 +1061,8 @@ def format_settings_text(chat_id):
         f"🎛️ *Mode actuel:* {mode_label(mode)}\n\n"
         f"🛡️ *Prudent* = moins de signaux, plus strict\n"
         f"⚖️ *Normal* = bon équilibre\n"
-        f"⚡ *Agressif* = plus d'opportunités"
+        f"⚡ *Agressif* = plus d'opportunités\n"
+        f"🔥 *Sniper* = ultra sélectif"
     )
 
 # =========================
@@ -1080,7 +1110,7 @@ def start_auto_scan_thread():
 # =========================
 @app.route("/")
 def home():
-    return "LVBXNT CRYPTO BOT V3 REAL AI is running!"
+    return "LVBXNT CRYPTO BOT V3.1 SNIPER MODE is running!"
 
 
 @app.route("/set_webhook")
@@ -1119,7 +1149,7 @@ def telegram_webhook():
 
         if normalized == "/start" or raw_text.lower() == "/start":
             welcome = (
-                "👑 *LVBXNT CRYPTO BOT — V3 REAL AI* 👑\n\n"
+                "👑 *LVBXNT CRYPTO BOT — V3.1 SNIPER MODE* 👑\n\n"
                 "Ton bot premium est prêt.\n\n"
                 "💰 *Cryptos supportées:*\n"
                 "`BTCUSDT` • `ETHUSDT` • `SOLUSDT` • `XRPUSDT`\n"
@@ -1129,7 +1159,8 @@ def telegram_webhook():
                 "✅ Auto Scan\n"
                 "✅ Watchlist\n"
                 "✅ Réglages Pro\n"
-                "✅ Exécution rapide iPhone\n\n"
+                "✅ Exécution rapide iPhone\n"
+                "✅ Mode Sniper\n\n"
                 "👇 *Choisis une option ou envoie une crypto*"
             )
             send_message(chat_id, welcome, main_menu())
@@ -1207,7 +1238,7 @@ def telegram_webhook():
                 "• Clique *📱 Exécution rapide*\n"
                 "• Recopie dans ton app mobile\n\n"
                 "💡 *Conseil:*\n"
-                "Commence en mode *Normal*."
+                "Mode *Sniper* = plus strict, moins de faux setups."
             )
             send_message(chat_id, msg, main_menu())
 
