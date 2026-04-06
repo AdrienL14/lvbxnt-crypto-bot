@@ -1,1067 +1,159 @@
-import os
-import sqlite3
-import time
-import uuid
-import requests
-from flask import Flask, request
+# 🔥 SEULEMENT PARTIE INLINE / CALLBACK REMASTER
 
-# =========================================================
-# CONFIG
-# =========================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
-
-CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
-CMC_BASE_URL = os.getenv("CMC_BASE_URL", "https://pro-api.coinmarketcap.com").strip()
-
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-app = Flask(__name__)
-
-SUPPORTED = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
-    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "MATICUSDT"
-]
-
-# ✅ Maintenant les 10 cryptos par défaut
-DEFAULT_WATCHLIST = SUPPORTED.copy()
-
-COINGECKO_IDS = {
-    "BTCUSDT": "bitcoin",
-    "ETHUSDT": "ethereum",
-    "SOLUSDT": "solana",
-    "XRPUSDT": "ripple",
-    "BNBUSDT": "binancecoin",
-    "ADAUSDT": "cardano",
-    "DOGEUSDT": "dogecoin",
-    "AVAXUSDT": "avalanche-2",
-    "LINKUSDT": "chainlink",
-    "MATICUSDT": "matic-network"
-}
-
-PAPRIKA_IDS = {
-    "BTCUSDT": "btc-bitcoin",
-    "ETHUSDT": "eth-ethereum",
-    "SOLUSDT": "sol-solana",
-    "XRPUSDT": "xrp-xrp",
-    "BNBUSDT": "bnb-binance-coin",
-    "ADAUSDT": "ada-cardano",
-    "DOGEUSDT": "doge-dogecoin",
-    "AVAXUSDT": "avax-avalanche",
-    "LINKUSDT": "link-chainlink",
-    "MATICUSDT": "matic-polygon"
-}
-
-KRAKEN_PAIRS = {
-    "BTCUSDT": "XBTUSD",
-    "ETHUSDT": "ETHUSD",
-    "SOLUSDT": "SOLUSD",
-    "XRPUSDT": "XRPUSD",
-    "ADAUSDT": "ADAUSD",
-    "DOGEUSDT": "DOGEUSD",
-    "AVAXUSDT": "AVAXUSD",
-    "LINKUSDT": "LINKUSD",
-    "MATICUSDT": "MATICUSD"
-}
-
-CACHE = {}
-CACHE_TTL = 180
-
-
-# =========================================================
-# DATABASE
-# =========================================================
-def db():
-    conn = sqlite3.connect("crypto_bot.db", check_same_thread=False, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-
-def init_db():
-    conn = db()
-    c = conn.cursor()
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        chat_id TEXT PRIMARY KEY,
-        mode TEXT DEFAULT 'NORMAL',
-        autoscan INTEGER DEFAULT 0
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS watchlists (
-        chat_id TEXT,
-        symbol TEXT
-    )
-    """)
-
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS signals (
-        signal_id TEXT PRIMARY KEY,
-        chat_id TEXT,
-        symbol TEXT,
-        signal TEXT,
-        score INTEGER,
-        entry REAL,
-        sl REAL,
-        tp1 REAL,
-        tp2 REAL,
-        tp3 REAL,
-        created_at INTEGER
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
-# =========================================================
-# CACHE
-# =========================================================
-def cache_get(key):
-    item = CACHE.get(key)
-    if not item:
-        return None
-    if time.time() - item["time"] > CACHE_TTL:
-        return None
-    return item["value"]
-
-
-def cache_set(key, value):
-    CACHE[key] = {"value": value, "time": time.time()}
-
-
-# =========================================================
-# USER SETTINGS
-# =========================================================
-def ensure_user(chat_id):
-    conn = db()
-    c = conn.cursor()
-    c.execute("SELECT chat_id FROM users WHERE chat_id=?", (str(chat_id),))
-    row = c.fetchone()
-
-    if not row:
-        c.execute(
-            "INSERT INTO users (chat_id, mode, autoscan) VALUES (?, ?, ?)",
-            (str(chat_id), "NORMAL", 0)
-        )
-        for s in DEFAULT_WATCHLIST:
-            c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), s))
-        conn.commit()
-
-    conn.close()
-
-
-def get_user_settings(chat_id):
-    ensure_user(chat_id)
-    conn = db()
-    c = conn.cursor()
-    c.execute("SELECT mode, autoscan FROM users WHERE chat_id=?", (str(chat_id),))
-    row = c.fetchone()
-    conn.close()
-    return row["mode"], row["autoscan"]
-
-
-def set_user_mode(chat_id, mode):
-    ensure_user(chat_id)
-    conn = db()
-    c = conn.cursor()
-    c.execute("UPDATE users SET mode=? WHERE chat_id=?", (mode, str(chat_id)))
-    conn.commit()
-    conn.close()
-
-
-def set_autoscan(chat_id, value):
-    ensure_user(chat_id)
-    conn = db()
-    c = conn.cursor()
-    c.execute("UPDATE users SET autoscan=? WHERE chat_id=?", (value, str(chat_id)))
-    conn.commit()
-    conn.close()
-
-
-def get_watchlist(chat_id):
-    ensure_user(chat_id)
-    conn = db()
-    c = conn.cursor()
-    c.execute("SELECT symbol FROM watchlists WHERE chat_id=?", (str(chat_id),))
-    rows = c.fetchall()
-    conn.close()
-    return [r["symbol"] for r in rows]
-
-
-def add_to_watchlist(chat_id, symbol):
-    wl = get_watchlist(chat_id)
-    if symbol not in wl:
-        conn = db()
-        c = conn.cursor()
-        c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), symbol))
-        conn.commit()
-        conn.close()
-
-
-def remove_from_watchlist(chat_id, symbol):
-    conn = db()
-    c = conn.cursor()
-    c.execute("DELETE FROM watchlists WHERE chat_id=? AND symbol=?", (str(chat_id), symbol))
-    conn.commit()
-    conn.close()
-
-
-def reset_watchlist(chat_id):
-    conn = db()
-    c = conn.cursor()
-    c.execute("DELETE FROM watchlists WHERE chat_id=?", (str(chat_id),))
-    for s in DEFAULT_WATCHLIST:
-        c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), s))
-    conn.commit()
-    conn.close()
-
-
-def select_all_watchlist(chat_id):
-    conn = db()
-    c = conn.cursor()
-    c.execute("DELETE FROM watchlists WHERE chat_id=?", (str(chat_id),))
-    for s in SUPPORTED:
-        c.execute("INSERT INTO watchlists (chat_id, symbol) VALUES (?, ?)", (str(chat_id), s))
-    conn.commit()
-    conn.close()
-
-
-def save_signal(chat_id, symbol, signal, score, entry, sl, tp1, tp2, tp3):
-    conn = db()
-    c = conn.cursor()
-    signal_id = str(uuid.uuid4())[:8]
-    c.execute("""
-        INSERT INTO signals (signal_id, chat_id, symbol, signal, score, entry, sl, tp1, tp2, tp3, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (signal_id, str(chat_id), symbol, signal, score, entry, sl, tp1, tp2, tp3, int(time.time())))
-    conn.commit()
-    conn.close()
-    return signal_id
-
-
-def get_last_signals(chat_id, limit=5):
-    conn = db()
-    c = conn.cursor()
-    c.execute("""
-        SELECT * FROM signals
-        WHERE chat_id=?
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (str(chat_id), limit))
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-def tg(method, payload):
-    url = f"{BASE_URL}/{method}"
-    return requests.post(url, json=payload, timeout=20)
-
-
-def send_message(chat_id, text, keyboard=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    tg("sendMessage", payload)
-
-
-def answer_callback(callback_id, text="OK"):
-    tg("answerCallbackQuery", {
-        "callback_query_id": callback_id,
-        "text": text,
-        "show_alert": False
-    })
-
-
-# =========================================================
+# =========================
 # KEYBOARDS
-# =========================================================
-def main_keyboard(chat_id):
-    _, autoscan = get_user_settings(chat_id)
-    auto_label = "🚨 Auto Scan ON" if autoscan else "🚨 Auto Scan OFF"
+# =========================
 
+def main_keyboard(chat_id):
+    auto = "🚨 Auto Scan ON" if is_auto_scan_enabled(chat_id) else "🚨 Auto Scan OFF"
     return {
         "inline_keyboard": [
-            [{"text": "🧠 Analyse Premium", "callback_data": "analyse"},
-             {"text": auto_label, "callback_data": "autoscan_toggle"}],
-            [{"text": "📈 Ma Watchlist", "callback_data": "watchlist"},
-             {"text": "🕓 Derniers Signaux", "callback_data": "signals"}],
-            [{"text": "⚙️ Réglages Pro", "callback_data": "settings"},
-             {"text": "❓ Guide Rapide", "callback_data": "guide"}]
+            [
+                {"text": "🧠 Analyse Premium", "callback_data": "analyse"},
+                {"text": auto, "callback_data": "autoscan"}
+            ],
+            [
+                {"text": "📈 Ma Watchlist", "callback_data": "watchlist"},
+                {"text": "🕓 Derniers Signaux", "callback_data": "signals"}
+            ],
+            [
+                {"text": "⚙️ Réglages Pro", "callback_data": "settings"},
+                {"text": "❓ Guide Rapide", "callback_data": "help"}
+            ]
+        ]
+    }
+
+
+def signal_menu(symbol):
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📱 Exécution rapide", "callback_data": f"exec:{symbol}"},
+                {"text": "🏠 Menu", "callback_data": "back_main"}
+            ]
         ]
     }
 
 
 def settings_keyboard(chat_id):
-    mode, autoscan = get_user_settings(chat_id)
-    auto_label = "❌ Auto Scan OFF" if autoscan == 0 else "✅ Auto Scan ON"
+    mode = get_user_mode(chat_id)
+    auto = "✅ Auto Scan ON" if is_auto_scan_enabled(chat_id) else "❌ Auto Scan OFF"
 
     return {
         "inline_keyboard": [
-            [{"text": auto_label, "callback_data": "toggle_autoscan"}],
-            [{"text": "🛡️ Prudent", "callback_data": "mode_PRUDENT"},
-             {"text": "⚖️ Normal", "callback_data": "mode_NORMAL"},
-             {"text": "⚡ Agressif", "callback_data": "mode_AGGRESSIVE"}],
-            [{"text": f"🎯 Mode actuel : {mode}", "callback_data": "noop"}],
-            [{"text": "🏠 Retour menu", "callback_data": "menu"}]
+            [{"text": auto, "callback_data": "autoscan"}],
+            [
+                {"text": "🛡️ Prudent", "callback_data": "mode:prudent"},
+                {"text": "⚖️ Normal", "callback_data": "mode:normal"},
+                {"text": "⚡ Agressif", "callback_data": "mode:aggressive"}
+            ],
+            [{"text": f"🎯 Mode actuel: {mode}", "callback_data": "noop"}],
+            [{"text": "🔙 Retour menu", "callback_data": "back_main"}]
         ]
     }
 
 
 def watchlist_keyboard(chat_id):
-    wl = get_watchlist(chat_id)
-    rows = []
-
-    for symbol in SUPPORTED:
-        if symbol in wl:
-            rows.append([{"text": f"✅ {symbol}", "callback_data": f"wl_remove_{symbol}"}])
-        else:
-            rows.append([{"text": f"➕ {symbol}", "callback_data": f"wl_add_{symbol}"}])
-
-    rows.append([
-        {"text": "🔥 Tout sélectionner", "callback_data": "wl_all"},
-        {"text": "♻️ Reset défaut", "callback_data": "wl_reset"}
-    ])
-    rows.append([{"text": "🏠 Retour menu", "callback_data": "menu"}])
-
-    return {"inline_keyboard": rows}
-
-
-# =========================================================
-# UI
-# =========================================================
-def show_menu(chat_id):
-    mode, autoscan = get_user_settings(chat_id)
-    text = (
-        "👑 <b>LVBXNT CRYPTO BOT — V2.5 GOD MODE</b> 👑\n\n"
-        "💎 <b>Bot crypto premium prêt à l’action</b>\n\n"
-        f"🤖 Auto Scan : {'ON ✅' if autoscan else 'OFF ❌'}\n"
-        f"🎯 Mode : <b>{mode}</b>\n"
-        f"📈 Watchlist : <b>{len(get_watchlist(chat_id))} cryptos</b>\n\n"
-        "💰 <b>Cryptos supportées :</b>\n"
-        "BTC • ETH • SOL • XRP • BNB\n"
-        "ADA • DOGE • AVAX • LINK • MATIC\n\n"
-        "👇 <b>Choisis une option ou envoie une crypto</b>"
-    )
-    send_message(chat_id, text, main_keyboard(chat_id))
-
-
-def show_settings(chat_id):
-    mode, autoscan = get_user_settings(chat_id)
-    text = (
-        "⚙️ <b>PARAMÈTRES PRO</b>\n\n"
-        f"🤖 Auto Scan : {'ON ✅' if autoscan else 'OFF ❌'}\n"
-        f"🎯 Mode actuel : <b>{mode}</b>\n\n"
-        "🛡️ <b>Prudent</b> = moins de signaux, plus strict\n"
-        "⚖️ <b>Normal</b> = bon équilibre\n"
-        "⚡ <b>Agressif</b> = plus d'opportunités"
-    )
-    send_message(chat_id, text, settings_keyboard(chat_id))
-
-
-def show_guide(chat_id):
-    text = (
-        "❓ <b>GUIDE RAPIDE</b>\n\n"
-        "📩 Envoie une crypto supportée :\n"
-        "<code>BTCUSDT</code>\n"
-        "<code>ETHUSDT</code>\n"
-        "<code>SOLUSDT</code>\n\n"
-        "🧠 Le bot te donne :\n"
-        "• BUY / SELL / NO TRADE\n"
-        "• Score qualité\n"
-        "• Entry / SL / TP1 / TP2 / TP3\n"
-        "• Résumé clair du setup\n\n"
-        "🚨 Si Auto Scan est activé :\n"
-        "• le bot peut scanner ta watchlist à la demande\n"
-        "• et te sortir les meilleurs setups"
-    )
-    send_message(chat_id, text, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
-
-
-def show_watchlist(chat_id):
-    wl = get_watchlist(chat_id)
-    text = (
-        f"📈 <b>MA WATCHLIST PREMIUM</b>\n\n"
-        f"📦 <b>Total :</b> {len(wl)} cryptos\n\n" +
-        "\n".join([f"• {x}" for x in wl])
-    )
-    send_message(chat_id, text, watchlist_keyboard(chat_id))
-
-
-def show_signals(chat_id):
-    rows = get_last_signals(chat_id, 5)
-    if not rows:
-        send_message(chat_id, "🕓 Aucun signal récent.", {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
-        return
-
-    text = "🕓 <b>DERNIERS SIGNAUX</b>\n\n"
-    for r in rows:
-        text += (
-            f"• <b>{r['symbol']}</b> — {r['signal']} — Score {r['score']}/100\n"
-            f"Entry {r['entry']} | SL {r['sl']} | TP1 {r['tp1']}\n\n"
-        )
-    send_message(chat_id, text, {"inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]})
-
-
-# =========================================================
-# DATA SOURCES
-# =========================================================
-def fetch_from_kraken(symbol):
-    cache_key = f"kraken_{symbol}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    pair = KRAKEN_PAIRS.get(symbol)
-    if not pair:
-        return None
-
-    try:
-        url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=60"
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        result = data.get("result", {})
-        if not result:
-            return None
-
-        key = None
-        for k in result.keys():
-            if k != "last":
-                key = k
-                break
-
-        if not key:
-            return None
-
-        candles = result.get(key, [])
-        prices = [float(c[4]) for c in candles][-120:]
-        if len(prices) < 30:
-            return None
-
-        cache_set(cache_key, prices)
-        return prices
-    except:
-        return None
-
-
-def fetch_from_coinmarketcap(symbol):
-    cache_key = f"cmc_{symbol}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    if not CMC_API_KEY:
-        return None
-
-    base = symbol.replace("USDT", "")
-
-    try:
-        url = f"{CMC_BASE_URL}/v1/cryptocurrency/quotes/latest"
-        headers = {
-            "X-CMC_PRO_API_KEY": CMC_API_KEY,
-            "Accept": "application/json"
-        }
-        params = {"symbol": base, "convert": "USD"}
-
-        r = requests.get(url, headers=headers, params=params, timeout=15)
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        coin = data.get("data", {}).get(base)
-        if not coin:
-            return None
-
-        price = float(coin["quote"]["USD"]["price"])
-        synthetic = [price * (1 + ((i - 60) / 5000.0)) for i in range(120)]
-
-        cache_set(cache_key, synthetic)
-        return synthetic
-    except:
-        return None
-
-
-def fetch_from_coingecko(symbol):
-    cache_key = f"cg_{symbol}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    coin_id = COINGECKO_IDS.get(symbol)
-    if not coin_id:
-        return None
-
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=7&interval=hourly"
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        prices = [float(x[1]) for x in data.get("prices", [])][-120:]
-        if len(prices) < 30:
-            return None
-
-        cache_set(cache_key, prices)
-        return prices
-    except:
-        return None
-
-
-def fetch_from_coinpaprika(symbol):
-    cache_key = f"paprika_{symbol}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    coin_id = PAPRIKA_IDS.get(symbol)
-    if not coin_id:
-        return None
-
-    try:
-        url = f"https://api.coinpaprika.com/v1/tickers/{coin_id}/historical?start=2026-04-01&interval=1h"
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        prices = [float(x["price"]) for x in data if x.get("price")][-120:]
-        if len(prices) < 30:
-            return None
-
-        cache_set(cache_key, prices)
-        return prices
-    except:
-        return None
-
-
-def fetch_from_dexscreener(symbol):
-    cache_key = f"dex_{symbol}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    base = symbol.replace("USDT", "")
-    try:
-        url = f"https://api.dexscreener.com/latest/dex/search?q={base}"
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        pairs = data.get("pairs", [])
-        if not pairs:
-            return None
-
-        prices = []
-        for p in pairs[:20]:
-            price = p.get("priceUsd")
-            if price:
-                prices.append(float(price))
-
-        if len(prices) < 3:
-            return None
-
-        synthetic = (prices * 40)[:120]
-        cache_set(cache_key, synthetic)
-        return synthetic
-    except:
-        return None
-
-
-def fetch_social_sentiment(symbol):
-    cache_key = f"st_{symbol}"
-    cached = cache_get(cache_key)
-    if cached:
-        return cached
-
-    try:
-        ticker = symbol.replace("USDT", "") + ".X"
-        url = f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return {"sentiment": "NEUTRE", "activity": "Faible"}
-
-        data = r.json()
-        messages = data.get("messages", [])
-        count = len(messages)
-
-        if count >= 20:
-            sentiment = "POSITIF"
-            activity = "Élevée"
-        elif count >= 8:
-            sentiment = "MODÉRÉ"
-            activity = "Correcte"
-        else:
-            sentiment = "FAIBLE"
-            activity = "Faible"
-
-        result = {"sentiment": sentiment, "activity": activity}
-        cache_set(cache_key, result)
-        return result
-    except:
-        return {"sentiment": "NEUTRE", "activity": "Faible"}
-
-
-def get_prices(symbol):
-    sources = [
-        fetch_from_kraken,
-        fetch_from_coinmarketcap,
-        fetch_from_coingecko,
-        fetch_from_coinpaprika,
-        fetch_from_dexscreener
+    current = get_watchlist(chat_id)
+    keyboard = [
+        [
+            {"text": "🔥 Tout sélectionner", "callback_data": "watch_all"},
+            {"text": "♻️ Reset", "callback_data": "watch_reset"}
+        ]
     ]
 
-    for fn in sources:
-        prices = fn(symbol)
-        if prices and len(prices) >= 30:
-            return prices
+    for symbol in SUPPORTED:
+        mark = "✅" if symbol in current else "➕"
+        keyboard.append([
+            {"text": f"{mark} {symbol}", "callback_data": f"toggle:{symbol}"}
+        ])
 
-    return None
-
-
-# =========================================================
-# INDICATORS
-# =========================================================
-def ema(values, period):
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    e = sum(values[:period]) / period
-    for price in values[period:]:
-        e = price * k + e * (1 - k)
-    return e
+    keyboard.append([{"text": "🔙 Retour menu", "callback_data": "back_main"}])
+    return {"inline_keyboard": keyboard}
 
 
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
+# =========================
+# CALLBACK HANDLER (PRO)
+# =========================
 
-    gains = []
-    losses = []
-
-    for i in range(1, period + 1):
-        diff = values[i] - values[i - 1]
-        if diff >= 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(diff))
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-# =========================================================
-# ANALYSIS ENGINE
-# =========================================================
-def analyze_symbol(symbol, mode="NORMAL"):
-    prices = get_prices(symbol)
-    if not prices or len(prices) < 50:
-        return None
-
-    current = prices[-1]
-    ema20_val = ema(prices, 20)
-    ema50_val = ema(prices, 50)
-    rsi_val = rsi(prices[-15:], 14)
-
-    if not ema20_val or not ema50_val or rsi_val is None:
-        return None
-
-    trend = "HAUSSIÈRE" if ema20_val > ema50_val else "BAISSIÈRE"
-    momentum_gap = abs(ema20_val - ema50_val) / current
-    momentum = "FORT" if momentum_gap > 0.01 else "MOYEN" if momentum_gap > 0.004 else "FAIBLE"
-
-    score = 50
-
-    if ema20_val > ema50_val:
-        score += 18
-    else:
-        score -= 18
-
-    if 45 <= rsi_val <= 60:
-        score += 10
-    elif rsi_val < 35:
-        score += 14
-    elif rsi_val > 70:
-        score -= 14
-
-    if momentum == "FORT":
-        score += 10
-    elif momentum == "FAIBLE":
-        score -= 6
-
-    recent_change = ((prices[-1] - prices[-6]) / prices[-6]) * 100 if prices[-6] != 0 else 0
-    if recent_change > 1.5:
-        score += 8
-    elif recent_change < -1.5:
-        score -= 8
-
-    score = max(0, min(100, int(score)))
-
-    if mode == "PRUDENT":
-        buy_threshold = 72
-        sell_threshold = 28
-    elif mode == "AGGRESSIVE":
-        buy_threshold = 58
-        sell_threshold = 42
-    else:
-        buy_threshold = 65
-        sell_threshold = 35
-
-    if score >= buy_threshold:
-        signal = "BUY"
-        sl = round(current * 0.98, 6)
-        tp1 = round(current * 1.02, 6)
-        tp2 = round(current * 1.04, 6)
-        tp3 = round(current * 1.06, 6)
-        grade = "A+" if score >= 82 else "A" if score >= 72 else "B+"
-    elif score <= sell_threshold:
-        signal = "SELL"
-        sl = round(current * 1.02, 6)
-        tp1 = round(current * 0.98, 6)
-        tp2 = round(current * 0.96, 6)
-        tp3 = round(current * 0.94, 6)
-        grade = "A+" if score <= 18 else "A" if score <= 28 else "B+"
-    else:
-        signal = "NO TRADE"
-        sl = round(current * 0.99, 6)
-        tp1 = round(current * 1.01, 6)
-        tp2 = round(current * 1.02, 6)
-        tp3 = round(current * 1.03, 6)
-        grade = "C"
-
-    social = fetch_social_sentiment(symbol)
-
-    return {
-        "symbol": symbol,
-        "signal": signal,
-        "score": score,
-        "grade": grade,
-        "trend": trend,
-        "momentum": momentum,
-        "price": round(current, 6),
-        "entry": round(current, 6),
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rsi": round(rsi_val, 2),
-        "ema20": round(ema20_val, 6),
-        "ema50": round(ema50_val, 6),
-        "social_sentiment": social["sentiment"],
-        "social_activity": social["activity"]
-    }
-
-
-def format_analysis(data):
-    verdict = "✅ Setup propre" if data["signal"] != "NO TRADE" else "⚪ Marché pas assez propre"
-
-    return (
-        f"🧠 <b>ANALYSE PREMIUM — {data['symbol']}</b>\n\n"
-        f"🚦 <b>Signal :</b> {data['signal']}\n"
-        f"🏆 <b>Grade :</b> {data['grade']}\n"
-        f"⭐ <b>Score :</b> {data['score']}/100\n\n"
-        f"📈 <b>Tendance :</b> {data['trend']}\n"
-        f"⚡ <b>Momentum :</b> {data['momentum']}\n"
-        f"📊 <b>RSI :</b> {data['rsi']}\n\n"
-        f"💰 <b>Prix :</b> {data['price']}\n"
-        f"🎯 <b>Entry :</b> {data['entry']}\n"
-        f"🛑 <b>Stop Loss :</b> {data['sl']}\n"
-        f"🎯 <b>TP1 :</b> {data['tp1']}\n"
-        f"🎯 <b>TP2 :</b> {data['tp2']}\n"
-        f"🎯 <b>TP3 :</b> {data['tp3']}\n\n"
-        f"🗣 <b>Sentiment social :</b> {data['social_sentiment']}\n"
-        f"📢 <b>Activité sociale :</b> {data['social_activity']}\n\n"
-        f"📝 <b>Résumé technique :</b>\n"
-        f"EMA20 = {data['ema20']} | EMA50 = {data['ema50']}\n\n"
-        f"{verdict}"
-    )
-
-
-def format_execution(data):
-    return (
-        f"📱 <b>EXÉCUTION RAPIDE — {data['symbol']}</b>\n\n"
-        f"🚦 {data['signal']}\n"
-        f"🎯 Entry : {data['entry']}\n"
-        f"🛑 SL : {data['sl']}\n"
-        f"🎯 TP1 : {data['tp1']}\n"
-        f"🎯 TP2 : {data['tp2']}\n"
-        f"🎯 TP3 : {data['tp3']}\n\n"
-        f"⭐ Score : {data['score']}/100"
-    )
-
-
-def format_scan_result(items, mode):
-    if not items:
-        return (
-            f"🚨 <b>AUTO SCAN — {mode}</b>\n\n"
-            "⚪ Aucun setup premium détecté pour l’instant.\n\n"
-            "💡 Reviens plus tard ou change le mode dans Réglages Pro."
-        )
-
-    text = f"🚨 <b>AUTO SCAN — {mode}</b>\n\n"
-    text += "🔥 <b>Meilleurs setups détectés :</b>\n\n"
-
-    for item in items[:5]:
-        text += (
-            f"• <b>{item['symbol']}</b> → {item['signal']} | "
-            f"Score {item['score']}/100 | Grade {item['grade']}\n"
-            f"Entry {item['entry']} | TP1 {item['tp1']} | SL {item['sl']}\n\n"
-        )
-
-    return text
-
-
-# =========================================================
-# BOT ACTIONS
-# =========================================================
-def handle_symbol(chat_id, symbol):
-    mode, _ = get_user_settings(chat_id)
-
-    send_message(chat_id, f"⏳ Analyse GOD MODE en cours sur <b>{symbol}</b>...")
-
-    data = analyze_symbol(symbol, mode)
-    if not data:
-        send_message(chat_id, "❌ Impossible de récupérer les données.\n\nRéessaie dans 1 à 2 minutes.")
-        return
-
-    signal_id = save_signal(
-        chat_id, symbol, data["signal"], data["score"],
-        data["entry"], data["sl"], data["tp1"], data["tp2"], data["tp3"]
-    )
-
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "📱 Exécution rapide", "callback_data": f"exec_{signal_id}"}],
-            [{"text": "🏠 Menu", "callback_data": "menu"}]
-        ]
-    }
-
-    send_message(chat_id, format_analysis(data), keyboard)
-
-
-def run_autoscan(chat_id):
-    mode, autoscan = get_user_settings(chat_id)
-
-    if not autoscan:
-        send_message(chat_id, "❌ Auto Scan est OFF.\n\nActive-le d’abord depuis le menu.")
-        return
-
-    wl = get_watchlist(chat_id)
-    if not wl:
-        send_message(chat_id, "⚠️ Ta watchlist est vide.")
-        return
-
-    send_message(chat_id, f"🚨 Scan intelligent en cours sur <b>{len(wl)}</b> cryptos...")
-
-    results = []
-
-    for symbol in wl:
-        data = analyze_symbol(symbol, mode)
-        if not data:
-            continue
-
-        if data["signal"] in ["BUY", "SELL"]:
-            if mode == "PRUDENT" and data["score"] >= 72:
-                results.append(data)
-            elif mode == "NORMAL" and data["score"] >= 65:
-                results.append(data)
-            elif mode == "AGGRESSIVE" and data["score"] >= 58:
-                results.append(data)
-
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
-
-    send_message(chat_id, format_scan_result(results, mode), {
-        "inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]
-    })
-
-
-def handle_callback(chat_id, callback_id, data):
+def handle_callback(chat_id, message_id, callback_id, action):
     ensure_user(chat_id)
+    answer_callback(callback_id)
 
-    if data == "menu":
-        answer_callback(callback_id, "Menu")
-        show_menu(chat_id)
+    if action == "noop":
+        return
 
-    elif data == "analyse":
-        answer_callback(callback_id, "Analyse")
-        send_message(chat_id, "📩 Envoie une crypto (ex: BTCUSDT)")
+    # =========================
+    # MENU
+    # =========================
+    if action == "back_main":
+        edit_message(chat_id, message_id, "🏠 Menu principal", main_keyboard(chat_id))
 
-    elif data == "autoscan_toggle":
-        mode, autoscan = get_user_settings(chat_id)
-        new_value = 0 if autoscan else 1
-        set_autoscan(chat_id, new_value)
+    elif action == "analyse":
+        send_message(chat_id, "📩 Envoie une crypto (ex: BTCUSDT)", main_keyboard(chat_id))
 
-        if new_value == 1:
-            answer_callback(callback_id, "Auto Scan ACTIVÉ")
-            send_message(chat_id, "🚨 Auto Scan ACTIVÉ ✅")
-            run_autoscan(chat_id)
-        else:
-            answer_callback(callback_id, "Auto Scan DÉSACTIVÉ")
-            send_message(chat_id, "🚨 Auto Scan DÉSACTIVÉ ❌")
-            show_menu(chat_id)
+    # =========================
+    # AUTO SCAN (PRO CLEAN)
+    # =========================
+    elif action == "autoscan":
+        current = is_auto_scan_enabled(chat_id)
+        set_auto_scan(chat_id, not current)
 
-    elif data == "watchlist":
-        answer_callback(callback_id, "Watchlist")
-        show_watchlist(chat_id)
+        status = "activé" if not current else "désactivé"
+        edit_message(
+            chat_id,
+            message_id,
+            f"🤖 Auto Scan {status}",
+            main_keyboard(chat_id)
+        )
 
-    elif data == "signals":
-        answer_callback(callback_id, "Signaux")
-        show_signals(chat_id)
+    # =========================
+    # SETTINGS
+    # =========================
+    elif action == "settings":
+        edit_message(chat_id, message_id, format_settings_text(chat_id), settings_keyboard(chat_id))
 
-    elif data == "settings":
-        answer_callback(callback_id, "Réglages")
-        show_settings(chat_id)
+    elif action.startswith("mode:"):
+        mode = action.split(":", 1)[1]
+        set_user_mode(chat_id, mode)
+        edit_message(chat_id, message_id, format_settings_text(chat_id), settings_keyboard(chat_id))
 
-    elif data == "guide":
-        answer_callback(callback_id, "Guide")
-        show_guide(chat_id)
+    # =========================
+    # WATCHLIST
+    # =========================
+    elif action == "watchlist":
+        edit_message(chat_id, message_id, format_watchlist_text(chat_id), watchlist_keyboard(chat_id))
 
-    elif data == "toggle_autoscan":
-        mode, autoscan = get_user_settings(chat_id)
-        new_value = 0 if autoscan else 1
-        set_autoscan(chat_id, new_value)
-        answer_callback(callback_id, "Auto Scan mis à jour")
-        show_settings(chat_id)
-
-    elif data.startswith("mode_"):
-        new_mode = data.replace("mode_", "")
-        set_user_mode(chat_id, new_mode)
-        answer_callback(callback_id, f"Mode {new_mode}")
-        show_settings(chat_id)
-
-    elif data.startswith("wl_add_"):
-        symbol = data.replace("wl_add_", "")
-        add_to_watchlist(chat_id, symbol)
-        answer_callback(callback_id, f"{symbol} ajouté")
-        show_watchlist(chat_id)
-
-    elif data.startswith("wl_remove_"):
-        symbol = data.replace("wl_remove_", "")
-        remove_from_watchlist(chat_id, symbol)
-        answer_callback(callback_id, f"{symbol} retiré")
-        show_watchlist(chat_id)
-
-    elif data == "wl_all":
+    elif action == "watch_all":
         select_all_watchlist(chat_id)
-        answer_callback(callback_id, "Toutes les cryptos ajoutées")
-        show_watchlist(chat_id)
+        edit_message(chat_id, message_id, format_watchlist_text(chat_id), watchlist_keyboard(chat_id))
 
-    elif data == "wl_reset":
+    elif action == "watch_reset":
         reset_watchlist(chat_id)
-        answer_callback(callback_id, "Watchlist remise par défaut")
-        show_watchlist(chat_id)
+        edit_message(chat_id, message_id, format_watchlist_text(chat_id), watchlist_keyboard(chat_id))
 
-    elif data.startswith("exec_"):
-        signal_id = data.replace("exec_", "")
-        conn = db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM signals WHERE signal_id=?", (signal_id,))
-        row = c.fetchone()
-        conn.close()
+    elif action.startswith("toggle:"):
+        symbol = action.split(":", 1)[1]
+        current = get_watchlist(chat_id)
 
-        if row:
-            fake_data = {
-                "symbol": row["symbol"],
-                "signal": row["signal"],
-                "score": row["score"],
-                "entry": row["entry"],
-                "sl": row["sl"],
-                "tp1": row["tp1"],
-                "tp2": row["tp2"],
-                "tp3": row["tp3"]
-            }
-            answer_callback(callback_id, "Exécution rapide")
-            send_message(chat_id, format_execution(fake_data), {
-                "inline_keyboard": [[{"text": "🏠 Menu", "callback_data": "menu"}]]
-            })
+        if symbol in current:
+            remove_from_watchlist(chat_id, symbol)
         else:
-            answer_callback(callback_id, "Signal introuvable")
+            add_to_watchlist(chat_id, symbol)
 
-    else:
-        answer_callback(callback_id, "OK")
+        edit_message(chat_id, message_id, format_watchlist_text(chat_id), watchlist_keyboard(chat_id))
 
+    # =========================
+    # SIGNAL HISTORY
+    # =========================
+    elif action == "signals":
+        send_message(chat_id, format_last_signals(chat_id), main_keyboard(chat_id))
 
-# =========================================================
-# ROUTES
-# =========================================================
-@app.route("/")
-def home():
-    return "LVBXNT CRYPTO BOT V2.5 GOD MODE RUNNING"
-
-
-@app.route("/set_webhook")
-def set_webhook():
-    if not BOT_TOKEN:
-        return "BOT_TOKEN manquant"
-
-    webhook_url = f"{request.host_url.rstrip('/')}/{BOT_TOKEN}"
-    r = requests.get(f"{BASE_URL}/setWebhook?url={webhook_url}")
-    return r.text
-
-
-@app.route("/delete_webhook")
-def delete_webhook():
-    r = requests.get(f"{BASE_URL}/deleteWebhook")
-    return r.text
-
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json(force=True)
-
-    if "message" in data:
-        msg = data["message"]
-        chat_id = msg["chat"]["id"]
-        text = msg.get("text", "").strip().upper()
-
-        ensure_user(chat_id)
-
-        if text == "/START":
-            show_menu(chat_id)
-        elif text in SUPPORTED:
-            handle_symbol(chat_id, text)
-        else:
-            send_message(chat_id, "❌ Crypto non reconnue.\n\nExemples : BTCUSDT, ETHUSDT, SOLUSDT")
-
-    elif "callback_query" in data:
-        cb = data["callback_query"]
-        callback_id = cb["id"]
-        chat_id = cb["message"]["chat"]["id"]
-        callback_data = cb["data"]
-
-        handle_callback(chat_id, callback_id, callback_data)
-
-    return "ok", 200
-
-
-# =========================================================
-# RUN
-# =========================================================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    # =========================
+    # EXECUTION
+    # =========================
+    elif action.startswith("exec:"):
+        symbol = action.split(":", 1)[1]
+        mode = get_user_mode(chat_id)
+        sig = analyze_symbol(symbol, mode)
+        send_message(chat_id, format_execution(sig), signal_menu(symbol))
