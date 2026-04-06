@@ -4,14 +4,16 @@ import time
 import math
 import uuid
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request
 
 # =========================================================
 # CONFIG
 # =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
+CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
+CMC_BASE_URL = os.getenv("CMC_BASE_URL", "https://pro-api.coinmarketcap.com").strip()
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 app = Flask(__name__)
@@ -23,7 +25,6 @@ SUPPORTED = [
 
 DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
 
-# CoinGecko vrais IDs
 COINGECKO_IDS = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
@@ -37,7 +38,6 @@ COINGECKO_IDS = {
     "MATICUSDT": "matic-network"
 }
 
-# CoinPaprika IDs
 PAPRIKA_IDS = {
     "BTCUSDT": "btc-bitcoin",
     "ETHUSDT": "eth-ethereum",
@@ -49,6 +49,19 @@ PAPRIKA_IDS = {
     "AVAXUSDT": "avax-avalanche",
     "LINKUSDT": "link-chainlink",
     "MATICUSDT": "matic-polygon"
+}
+
+KRAKEN_PAIRS = {
+    "BTCUSDT": "XBTUSD",
+    "ETHUSDT": "ETHUSD",
+    "SOLUSDT": "SOLUSD",
+    "XRPUSDT": "XRPUSD",
+    "ADAUSDT": "ADAUSD",
+    "DOGEUSDT": "DOGEUSD",
+    "AVAXUSDT": "AVAXUSD",
+    "LINKUSDT": "LINKUSD",
+    "MATICUSDT": "MATICUSD"
+    # BNB souvent absent / variable sur Kraken
 }
 
 CACHE = {}
@@ -103,7 +116,7 @@ def init_db():
 init_db()
 
 # =========================================================
-# HELPERS
+# CACHE
 # =========================================================
 def cache_get(key):
     item = CACHE.get(key)
@@ -116,6 +129,9 @@ def cache_get(key):
 def cache_set(key, value):
     CACHE[key] = {"value": value, "time": time.time()}
 
+# =========================================================
+# USER SETTINGS
+# =========================================================
 def ensure_user(chat_id):
     conn = db()
     c = conn.cursor()
@@ -245,11 +261,11 @@ def settings_keyboard(chat_id):
     }
 
 # =========================================================
-# UI TEXT
+# UI
 # =========================================================
 def show_menu(chat_id):
     text = (
-        "👑 <b>LVBXNT CRYPTO BOT — V2.2 PRO</b> 👑\n\n"
+        "👑 <b>LVBXNT CRYPTO BOT — V2.3 ULTRA PRO</b> 👑\n\n"
         "Ton bot crypto premium est prêt.\n\n"
         "💰 <b>Cryptos supportées :</b>\n"
         "BTC • ETH • SOL • XRP • BNB\n"
@@ -265,7 +281,6 @@ def show_menu(chat_id):
 
 def show_settings(chat_id):
     mode, autoscan = get_user_settings(chat_id)
-
     text = (
         "⚙️ <b>PARAMÈTRES PRO</b>\n\n"
         f"🤖 Auto Scan : {'ON ✅' if autoscan else 'OFF ❌'}\n"
@@ -309,12 +324,87 @@ def show_signals(chat_id):
             f"• <b>{r['symbol']}</b> — {r['signal']} — Score {r['score']}/100\n"
             f"Entry {r['entry']} | SL {r['sl']} | TP1 {r['tp1']}\n\n"
         )
-
     send_message(chat_id, text, {"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"menu"}]]})
 
 # =========================================================
 # DATA SOURCES
 # =========================================================
+def fetch_from_kraken(symbol):
+    cache_key = f"kraken_{symbol}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    pair = KRAKEN_PAIRS.get(symbol)
+    if not pair:
+        return None
+
+    try:
+        url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=60"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+        result = data.get("result", {})
+        if not result:
+            return None
+
+        key = None
+        for k in result.keys():
+            if k != "last":
+                key = k
+                break
+
+        if not key:
+            return None
+
+        candles = result.get(key, [])
+        prices = [float(c[4]) for c in candles][-120:]  # close
+        if len(prices) < 30:
+            return None
+
+        cache_set(cache_key, prices)
+        return prices
+    except:
+        return None
+
+def fetch_from_coinmarketcap(symbol):
+    cache_key = f"cmc_{symbol}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    if not CMC_API_KEY:
+        return None
+
+    base = symbol.replace("USDT", "")
+
+    try:
+        url = f"{CMC_BASE_URL}/v1/cryptocurrency/quotes/latest"
+        headers = {
+            "X-CMC_PRO_API_KEY": CMC_API_KEY,
+            "Accept": "application/json"
+        }
+        params = {"symbol": base, "convert": "USD"}
+
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+        coin = data.get("data", {}).get(base)
+        if not coin:
+            return None
+
+        price = float(coin["quote"]["USD"]["price"])
+        synthetic = [price * (1 + ((i - 60) / 5000.0)) for i in range(120)]
+
+        cache_set(cache_key, synthetic)
+        return synthetic
+    except:
+        return None
+
 def fetch_from_coingecko(symbol):
     cache_key = f"cg_{symbol}"
     cached = cache_get(cache_key)
@@ -326,10 +416,7 @@ def fetch_from_coingecko(symbol):
         return None
 
     try:
-        url = (
-            f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-            f"?vs_currency=usd&days=7&interval=hourly"
-        )
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=7&interval=hourly"
         r = requests.get(url, timeout=15)
         if r.status_code != 200:
             return None
@@ -397,9 +484,7 @@ def fetch_from_dexscreener(symbol):
         if len(prices) < 3:
             return None
 
-        synthetic = prices * 40
-        synthetic = synthetic[:120]
-
+        synthetic = (prices * 40)[:120]
         cache_set(cache_key, synthetic)
         return synthetic
     except:
@@ -440,6 +525,8 @@ def fetch_social_sentiment(symbol):
 
 def get_prices(symbol):
     sources = [
+        fetch_from_kraken,
+        fetch_from_coinmarketcap,
         fetch_from_coingecko,
         fetch_from_coinpaprika,
         fetch_from_dexscreener
@@ -453,7 +540,7 @@ def get_prices(symbol):
     return None
 
 # =========================================================
-# ANALYSIS
+# INDICATORS
 # =========================================================
 def ema(values, period):
     if len(values) < period:
@@ -489,36 +576,50 @@ def rsi(values, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+# =========================================================
+# ANALYSIS ENGINE
+# =========================================================
 def analyze_symbol(symbol, mode="NORMAL"):
     prices = get_prices(symbol)
     if not prices or len(prices) < 50:
         return None
 
     current = prices[-1]
-    ema20 = ema(prices, 20)
-    ema50 = ema(prices, 50)
+    ema20_val = ema(prices, 20)
+    ema50_val = ema(prices, 50)
     rsi_val = rsi(prices[-15:], 14)
 
-    if not ema20 or not ema50 or rsi_val is None:
+    if not ema20_val or not ema50_val or rsi_val is None:
         return None
 
-    trend = "HAUSSIÈRE" if ema20 > ema50 else "BAISSIÈRE"
-    momentum = "FORT" if abs(ema20 - ema50) / current > 0.01 else "MOYEN"
+    trend = "HAUSSIÈRE" if ema20_val > ema50_val else "BAISSIÈRE"
+    momentum_gap = abs(ema20_val - ema50_val) / current
+    momentum = "FORT" if momentum_gap > 0.01 else "MOYEN" if momentum_gap > 0.004 else "FAIBLE"
 
     score = 50
 
-    if ema20 > ema50:
-        score += 20
+    if ema20_val > ema50_val:
+        score += 18
     else:
-        score -= 20
+        score -= 18
 
-    if rsi_val < 35:
-        score += 15
-    elif rsi_val > 65:
-        score -= 15
+    if 45 <= rsi_val <= 60:
+        score += 10
+    elif rsi_val < 35:
+        score += 14
+    elif rsi_val > 70:
+        score -= 14
 
     if momentum == "FORT":
         score += 10
+    elif momentum == "FAIBLE":
+        score -= 6
+
+    recent_change = ((prices[-1] - prices[-6]) / prices[-6]) * 100 if prices[-6] != 0 else 0
+    if recent_change > 1.5:
+        score += 8
+    elif recent_change < -1.5:
+        score -= 8
 
     score = max(0, min(100, int(score)))
 
@@ -538,14 +639,14 @@ def analyze_symbol(symbol, mode="NORMAL"):
         tp1 = round(current * 1.02, 4)
         tp2 = round(current * 1.04, 4)
         tp3 = round(current * 1.06, 4)
-        grade = "A+" if score >= 80 else "A" if score >= 70 else "B"
+        grade = "A+" if score >= 82 else "A" if score >= 72 else "B+"
     elif score <= sell_threshold:
         signal = "SELL"
         sl = round(current * 1.02, 4)
         tp1 = round(current * 0.98, 4)
         tp2 = round(current * 0.96, 4)
         tp3 = round(current * 0.94, 4)
-        grade = "A+" if score <= 20 else "A" if score <= 30 else "B"
+        grade = "A+" if score <= 18 else "A" if score <= 28 else "B+"
     else:
         signal = "NO TRADE"
         sl = round(current * 0.99, 4)
@@ -570,8 +671,8 @@ def analyze_symbol(symbol, mode="NORMAL"):
         "tp2": tp2,
         "tp3": tp3,
         "rsi": round(rsi_val, 2),
-        "ema20": round(ema20, 4),
-        "ema50": round(ema50, 4),
+        "ema20": round(ema20_val, 4),
+        "ema50": round(ema50_val, 4),
         "social_sentiment": social["sentiment"],
         "social_activity": social["activity"]
     }
@@ -595,7 +696,7 @@ def format_analysis(data):
         f"🎯 <b>TP3 :</b> {data['tp3']}\n\n"
         f"🗣 <b>Sentiment social :</b> {data['social_sentiment']}\n"
         f"📢 <b>Activité sociale :</b> {data['social_activity']}\n\n"
-        f"📝 <b>Résumé :</b>\n"
+        f"📝 <b>Résumé technique :</b>\n"
         f"EMA20 = {data['ema20']} | EMA50 = {data['ema50']}\n\n"
         f"{verdict}"
     )
@@ -613,12 +714,12 @@ def format_execution(data):
     )
 
 # =========================================================
-# HANDLERS
+# BOT ACTIONS
 # =========================================================
 def handle_symbol(chat_id, symbol):
     mode, _ = get_user_settings(chat_id)
 
-    send_message(chat_id, f"⏳ Analyse PRO en cours sur <b>{symbol}</b>...")
+    send_message(chat_id, f"⏳ Analyse ULTRA PRO en cours sur <b>{symbol}</b>...")
 
     data = analyze_symbol(symbol, mode)
     if not data:
@@ -713,11 +814,11 @@ def handle_callback(chat_id, callback_id, data):
         answer_callback(callback_id, "OK")
 
 # =========================================================
-# FLASK ROUTES
+# ROUTES
 # =========================================================
 @app.route("/")
 def home():
-    return "LVBXNT CRYPTO BOT V2.2 RUNNING"
+    return "LVBXNT CRYPTO BOT V2.3 ULTRA PRO RUNNING"
 
 @app.route("/set_webhook")
 def set_webhook():
